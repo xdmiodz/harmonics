@@ -3,7 +3,6 @@
 #include "stdio.h"
 #include "cudpp.h"
 
-#define MAX_THREADS (128)
 #define PI (3.14159265)
 
 __device__  float kernel_sinm(float fn, float fce, float t)
@@ -183,7 +182,11 @@ int main(int argc, char** argv)
 	printf("Parameters:\n");
 	printf("fce = %e Hz,\nfm = %e Hz,\navar = %e V/cm,\naconst = %e V/cm,\nnh = %d,\ntstart = %e sec.,\ntstop = %e sec.,\nntpoints = %d\n", fce/2/PI, fm/2/PI, avar, aconst, (int)nh, tstart, tstop, (int)ntpoints);
 	
-  
+	int MAX_THREADS = 128;
+	if (nh < MAX_THREADS)
+	{
+		MAX_THREADS = nh;
+	}
 	float* an = (float*)malloc(sizeof(float)*nh);
 	float* fn = (float*)malloc(sizeof(float)*nh);
 	float* vnp = (float*)malloc(sizeof(float)*nh);
