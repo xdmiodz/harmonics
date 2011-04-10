@@ -16,5 +16,5 @@ INCLUDE = -I$(HOMEDIR) \
           -I$(CUDPPINC)
 
 LIBS = -lcudpp_i686
-harm : 
+harm : main.cu
 	$(CU) $(INCLUDE) -o harm  main.cu -L$(CUDPPLIB) $(LIBS)
