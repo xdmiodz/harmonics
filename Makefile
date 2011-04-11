@@ -17,4 +17,7 @@ INCLUDE = -I$(HOMEDIR) \
 
 LIBS = -lcudpp_i686 -lconfig
 harm : main.cu
-	$(CU) $(INCLUDE) -o harm  main.cu -L$(CUDPPLIB) $(LIBS)
+	$(CU) $(INCLUDE) -O2 -o harm  main.cu -L$(CUDPPLIB) $(LIBS)
+
+harm_debug : main.cu
+	$(CU) $(INCLUDE) -g -o harm main.cu -L$(CUDPPLIB) $(LIBS)
