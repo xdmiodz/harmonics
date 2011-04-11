@@ -2,8 +2,20 @@
 #include "math.h"
 #include "stdio.h"
 #include "cudpp.h"
+#include "libconfig.h"
 
 #define PI (3.14159265)
+
+
+typedef struct pulse_cfg_str
+{
+	float A0;
+	float Am;
+	float T;
+	float fm;
+	float fce;
+	
+}pulse;
 
 __device__  float kernel_sinm(float fn, float fce, float t)
 {
@@ -168,8 +180,19 @@ void generate_tn(float tstart, float tstop, size_t ntpoints, float* tn)
 	}
 }
 
+int my_read_config_file(char* file, config_t* config)
+{
+	config_init(config);
+	return config_read_file(config, file);
+}
+
 int main(int argc, char** argv)
 {
+	char* config_file = argv[1];
+	config_t config;
+	my_read_config_file(config_file, &config);
+
+	
 	float fce = 2*PI*atof(argv[1]);
 	float fm  = 2*PI*atof(argv[2]);
 	float avar  = atof(argv[3]);
@@ -364,6 +387,6 @@ int main(int argc, char** argv)
 		printf("Error destroying CUDPPPlan\n");
 		exit(-1);
 	}
-	
+	config_destroy(&config);
 	printf("The programm is done!\n");
 }

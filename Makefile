@@ -15,6 +15,6 @@ CUDPPINC = $(CUDPP_HOME)/cudpp/include/
 INCLUDE = -I$(HOMEDIR) \
           -I$(CUDPPINC)
 
-LIBS = -lcudpp_i686
+LIBS = -lcudpp_i686 -lconfig
 harm : main.cu
 	$(CU) $(INCLUDE) -o harm  main.cu -L$(CUDPPLIB) $(LIBS)
