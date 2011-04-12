@@ -12,6 +12,11 @@
 			printf("Error %d at %s:%d\n", x, __FILE__,__LINE__); \
 			exit(EXIT_FAILURE);}}
 
+#define CUDA_CALL(x) { if((x) != cudaSuccess) { \
+			printf("Cuda error %d at %s:%d: ", x, __FILE__,__LINE__); \
+			printf("%s\n", cudaGetErrorString(x));		\
+			exit(EXIT_FAILURE);}}
+
 
 typedef struct pulse_cfg_str
 {
@@ -123,9 +128,9 @@ int get_simulation_config(config_t* config, simulation_t* simulation)
 	setting = config_lookup(config, "simulation.ncells");
 	simulation->ncells = config_setting_get_int64(setting);
 	setting = config_lookup(config, "simulation.z1");
-	simulation->ncells = (float)config_setting_get_float(setting);
+	simulation->z1 = (float)config_setting_get_float(setting);
 	setting = config_lookup(config, "simulation.z2");
-	simulation->ncells = (float)config_setting_get_float(setting);
+	simulation->z2 = (float)config_setting_get_float(setting);
 	return 0;
 }
 
@@ -139,8 +144,6 @@ int get_electron_config(config_t* config, electron_t* electron)
 	electron->q = (float)config_setting_get_float(setting);
 	return  0;
 }
-
-
 
 __device__  float kernel_sinm(float fn, float fce, float t)
 {
@@ -164,61 +167,6 @@ __device__  float kernel_cosp(float fn, float fce, float t)
 	return cos((fn + fce)*t);
 }
 
-__global__ void global_calculate_vt(float* fn, float* fce, float* vnp, float* vnm, long long nh, float* tn, float* vt)
-{      
-	long long nt = blockDim.x*blockIdx.x + threadIdx.x;
-	float t = tn[nt];
-	long long i;
-	float kfce = *fce;
-	float sinp;
-	float sinm;
-	
-	float vnt = 0;
-	for ( i = 0; i < nh; ++i )
-	{
-		float fnt = fn[i];
-		float vnpt = vnp[i];
-		float vnmt = vnm[i];
-		sinp = kernel_sinp(fnt, kfce, t);
-		sinm = kernel_sinm(fnt, kfce, t);
-		vnt  += vnpt*sinp + vnmt*sinm;
-	}
-	vt[nt] = vnt;
-}
-
-__global__ void global_calculate_increase_vt(float* fce, float* tn, float* pulse_an, float* vt)
-{
-	long long nt = blockDim.x*blockIdx.x + threadIdx.x;
-	float t = tn[nt];
-	float kfce = *fce;
-	vt[nt] = pulse_an[nt]*t*sin(kfce*t);
-}
-
-__global__ void global_calculate_v3(float C, float *fce, float* tn, float* v3)
-{
-	size_t nt = blockDim.x*blockIdx.x + threadIdx.x;
-	float t = tn[nt];
-	float kfce = *fce;
-	v3[nt] = -(C/kfce)*sin(kfce*t);
-}
-
-
-__global__ void global_calc_the_constant(float* fce, float* fn, float* vnp, float* vnm, float* cn)
-{
-	size_t nh = blockDim.x*blockIdx.x + threadIdx.x;
-	float fhn = fn[nh];
-	float tfce = *fce;
-	float vnpn = vnp[nh];
-	float vnmn = vnm[nh];
-	cn[nh] = (fhn + tfce)*vnpn + (fhn - tfce)*vnmn;
-} 
-
-__global__ void global_calculate_vt2(float* vt, float* vt2)
-{
-	long long nt = blockDim.x*blockIdx.x + threadIdx.x;
-	float vtn = vt[nt];
-	vt2[nt] = vtn*vtn;
-}
 
 __global__ void global_calculate_et(float* fn, float* fce, float* enp, float* enm, long long nh, float* tn, float* et)
 {      
@@ -243,56 +191,22 @@ __global__ void global_calculate_et(float* fn, float* fce, float* enp, float* en
 	et[nt] = ent;
 }
 
-__global__ void global_get_all_speeds_alltogether(float *d_vi, float* d_vn, float* d_v)
+__global__ void kernel_generate_amfm(float am, float fm, float nh, float* d_fm, float* d_am)
 {
-	long long nt = blockDim.x*blockIdx.x + threadIdx.x;
-	d_v[nt] = (d_vn[nt] + d_vi[nt]);
+	long long i = blockDim.x*blockIdx.x + threadIdx.x;
+	d_am[i] = 4*am/PI/(2*i + 1);
+	d_fm[i] = fm*(2*i + 1);	
 }
 
-void generate_am(float Am, float fm, long long nh, float* am, float* tn, long long ntpoints)
+__global__ void generate_ameandr(float* d_am, float* d_fm, float* tn,  long long nh, float* d_a)
 {
+	long long n = blockDim.x*blockIdx.x + threadIdx.x;
 	long long i;
-	long long j;
-	float* fn = (float*)malloc(sizeof(float)*nh);
-	float* an = (float*)malloc(sizeof(float)*nh);
-	float a = Am*4/PI;
+	float t = tn[n];
 	for (i = 0; i < nh; ++i)
 	{
-		an[i] = a/(2*i+1);
-		fn[i] = fm*(2*i+1);
+		d_a[n] += d_am[i]*sin(d_fm[i]*t);
 	}
-	for(i = 0; i < ntpoints; ++i)
-	{
-		am[i] = 0;
-		for (j = 0; j < nh; ++j)
-		{
-			am[i] += an[j]*sin(fn[j]*tn[i]);
-		}
-	}
-}
-
-void generate_fn(float fm, long long nh, float* fn)
-{
-	long long i;
-	for (i = 0; i < nh; ++i)
-	{
-		fn[i] = fm*(2*i+1);
-	}
-}
-
-void generate_vn(float* an, float* fn, float fce,
-		 long long nh, float* vnp, float* vnm)
-{
-	long long i;
-	float fce2 = fce*fce;
-	for (i = 0; i < nh; ++i)
-	{
-		float fs = fn[i] + fce;
-		float fd = fn[i] - fce;
-     
-		vnp[i] = 0.5*an[i]*(fs/(fce2 - pow(fs,2)));
-		vnm[i] = -0.5*an[i]*(fd/(fce2 - pow(fd,2)));
-	}	
 }
 
 void generate_en(float* an, float* fn, float fce,
@@ -306,32 +220,6 @@ void generate_en(float* an, float* fn, float fce,
 	}	
 }
 
-void generate_tn(float tstart, float tstop, long long ntpoints, float* tn)
-{
-	long long i;
-	float dt = (tstop - tstart)/ntpoints;
-	for (i = 0; i < ntpoints; ++i)
-	{
-		tn[i] = tstart + dt*i;
-	}
-}
-
-void generate_pulse_amp(float pulse_duration, long long ntpoints, float* tn, 
-			float A0, float* am, float fce, float* pulse_an)
-{
-	long long i;
-	for(i = 0; i < ntpoints; ++i)
-	{
-		if(pulse_duration >= tn[i])
-		{
-			pulse_an[i] =  0.5*(A0 + am[i])*sin(fce*tn[i]);
-		}
-		else
-		{
-			pulse_an[i] =  am[i]*sin(fce*tn[i]);
-		}
-	}
-}
 
 int my_read_config_file(char* file, config_t* config)
 {
@@ -344,7 +232,7 @@ __global__ void global_generate_cells_bounds(float z1, float dz,
 {
 	long long n = blockDim.x*blockIdx.x + threadIdx.x;
 	d_lcell[n] = z1 + n*dz;
-	d_rcell[n] = z1 + (n + 1)*dz;
+	d_rcell[n] = d_lcell[n] + dz;
 }
 
 __global__ void global_associate_electrons_with_cells(float* d_z, float* d_lcell, 
@@ -364,30 +252,30 @@ __global__ void global_associate_electrons_with_cells(float* d_z, float* d_lcell
 }
 
 __device__ float get_ex_field(float A0, float pulse_duration, 
-			      float z, float t, 
+			      float z, long long nt, 
 			      float z0, float dz,
-			      float* am, float* fm, 
-			      float nh, float fce)
+			      float* am, float* tn)
 {
-	long long i;
-	float a = (fabs(z - z0) <= dz) ? 1 : 0;
-	float ameandr = 0;
-	for(i = 0; i < nh; i++)
-	{
-		ameandr = am[i]*sin(fm[i]*t);
-	}
-	return 0.5*a*(ameandr + A0)*sin(fce*t);
+	float az = (fabs(z - z0) <= dz) ? 1 : 0;  
+	float at = (tn[nt] - pulse_duration) < 0 ? 1 : 0;
+	return 0.5*az*at*(am[nt] + A0);
 	
 }
 
-__global__ void update_ex_field(float A0, long long nharm, 
-				float* d_am, float* d_fm, float fce, float t, 
-				float pulse_duration, float z0, float dz, 
+__global__ void update_ex_field(float A0, float* d_am, float fce, float* tn, 
+				long long nt, float pulse_duration, float z0, float dz, 
 				float* d_lcell, float* d_rcell, float* d_ex)
 {
 	long long n = blockDim.x*blockIdx.x + threadIdx.x;
         float z = 0.5*(d_lcell[n] + d_rcell[n]);
-	d_ex[n] = get_ex_field(A0, pulse_duration, z, t, z0, dz, d_am, d_fm, nharm, fce);
+	float sfce = sin(fce*tn[nt]);
+	d_ex[n] = get_ex_field(A0, pulse_duration, z, nt, z0, dz, d_am, tn)*sfce;
+}
+
+__global__ void kernel_generate_tn(float tstart, float dt, float* d_tn)
+{
+	long long n = blockDim.x*blockIdx.x + threadIdx.x;
+	d_tn[n] = tstart + n*dt;
 }
 
 
@@ -418,6 +306,20 @@ __global__ void trace_electrons_single_step(float* d_vx, float* d_vy, float* d_v
 	long long ncell = d_associate[n];
 	rotate_particle(&vxt, &vyt,  d_ex[ncell], tfce, dt);
 	d_z[n] += d_vz[n]*dt; 
+}
+
+__global__ void postproc(float* d_z, float zmin, float zmax)
+{
+	long long n = blockDim.x*blockIdx.x + threadIdx.x;
+	float L = zmax - zmin;
+	if(d_z[n] > zmax)
+	{
+		d_z[n] -= L;
+	}
+	if(d_z[n] < zmin)
+	{
+		d_z[n] += L;
+	}
 }
 
 __global__ void calculate_v2_zdistribution(float* d_vx, float* d_vy, 
@@ -451,6 +353,8 @@ int main(int argc, char** argv)
 	float fm  = 2*PI*pulse.fm;
 	float Am  = pulse.Am;
 	float A0 = pulse.A0;
+	float pulse_dz = pulse.dz;
+	float pulse_z0 = pulse.z0;
 	long long nh  = simulation.nh;
 	float tstart = simulation.Tstart;
 	float tstop = simulation.Tstop;
@@ -458,9 +362,18 @@ int main(int argc, char** argv)
 	float pulse_duration = pulse.T;
 	long long ncells = simulation.ncells;
 	long long nelectrons = simulation.nelectrons;
+	long long max_threads = global_settings.max_gpu_threads;
+	float z1 = simulation.z1;
+	float z2 = simulation.z2;
+	float dz = (z2-z1)/ncells;
+	float q = electron.q;
+	float m = electron.m;
+	float Te = electron.T;
+	float sigma = sqrt(EV_IN_ERGS*Te/m);
+	float dt = (tstop - tstart)/ntpoints;
 	curandGenerator_t cuda_r;
 	CURAND_CALL(curandCreateGenerator(&cuda_r, CURAND_RNG_PSEUDO_DEFAULT));
-        CURAND_CALL(curandSetPseudoRandomGeneratorSeed(cuda_r, 1234ULL));
+        CURAND_CALL(curandSetPseudoRandomGeneratorSeed(cuda_r, 5678ULL));
 
 	long long* cell_electron_association = (long long*)malloc(sizeof(long long)*nelectrons);
 	
@@ -468,42 +381,94 @@ int main(int argc, char** argv)
 	float* d_vx = NULL;
 	float* d_vy = NULL;
 	float* d_vz = NULL;
+	float* d_z = NULL;
 	float* d_ex = NULL;
-	float* d_cell_electron_association = NULL;
+	long long* d_cell_electron_association = NULL;
 	float* d_lcell = NULL;
 	float* d_rcell = NULL;
+	float* d_tn = NULL;
+	float* v2 = (float*)malloc(sizeof(float)*ncells);
 	float* v = (float*)malloc(sizeof(float)*nelectrons);
-	float* tn = (float*)malloc(sizeof(float)*ntpoints);
+	float* d_am = NULL;
+	float* d_fm = NULL;
+	float* d_a = NULL;
+	float delta;
 
-	cudaMalloc(&d_vx, sizeof(float)*nelectrons);
-	cudaMalloc(&d_vy, sizeof(float)*nelectrons);
-	cudaMalloc(&d_vz, sizeof(float)*nelectrons);
-	cudaMalloc(&d_ex, sizeof(float)*ncells);
-	cudaMalloc(&d_lcell, sizeof(float)*ncells);
-	cudaMalloc(&d_rcell, sizeof(float)*ncells);
+	CUDA_CALL(cudaMalloc(&d_vx, sizeof(float)*nelectrons));
+	CUDA_CALL(cudaMalloc(&d_vy, sizeof(float)*nelectrons));
+	CUDA_CALL(cudaMalloc(&d_vz, sizeof(float)*nelectrons));
+	CUDA_CALL(cudaMalloc(&d_z, sizeof(float)*nelectrons));
+	CUDA_CALL(cudaMalloc(&d_tn, sizeof(float)*ntpoints));
+	CUDA_CALL(cudaMalloc(&d_ex, sizeof(float)*ncells));
+	CUDA_CALL(cudaMalloc(&d_lcell, sizeof(float)*ncells));
+	CUDA_CALL(cudaMalloc(&d_rcell, sizeof(float)*ncells));
+	CUDA_CALL(cudaMalloc(&d_am, sizeof(float)*nh));
+	CUDA_CALL(cudaMalloc(&d_fm, sizeof(float)*nh));
+	CUDA_CALL(cudaMalloc(&d_a, sizeof(float)*ntpoints));
+	CUDA_CALL(cudaMalloc(&d_cell_electron_association, sizeof(long long)*nelectrons));
 
-	cudaMalloc(&d_cell_electron_association, sizeof(long long)*nelectrons);
+	printf("Preparing the initial data\n");
+
+	CUDA_CALL(cudaMemset(d_a, 0, sizeof(float)*ntpoints));
 	
-	float* am = (float*)malloc(sizeof(float)*ntpoints);
-	float* pulse_an = (float*)malloc(sizeof(float)*ncells);
+	kernel_generate_tn<<<ntpoints/max_threads, max_threads>>>(tstart, dt, d_tn); 
+	kernel_generate_amfm<<<1,nh>>>(Am, fm, nh, d_fm, d_am);
+	generate_ameandr<<<ntpoints/max_threads, max_threads>>>(d_am, d_fm, d_tn,  nh, d_a);
+	global_generate_cells_bounds<<<ncells/max_threads, max_threads>>>(z1, dz, d_lcell, d_rcell);
+	set_speed_maxwell_cuda(cuda_r, d_vx, sigma, nelectrons);
+	set_speed_maxwell_cuda(cuda_r, d_vy, sigma, nelectrons);
+	set_speed_maxwell_cuda(cuda_r, d_vz, sigma, nelectrons);
+	set_pos_uniform_cuda(cuda_r, d_z, z1, z2, nelectrons, max_threads);
 	
 	long long i = 0;
 	FILE* to;	
 		
 	printf("Start the calculations!\n");	
-     
+
+	for(i = 0; i < ntpoints; ++i)
+	{
+		update_ex_field<<<ncells/max_threads, max_threads>>>(A0, d_a, fce, d_tn, i, pulse_duration, 
+								     pulse_z0, pulse_dz, d_lcell, d_rcell, 
+								     d_ex);
+		postproc<<<nelectrons/max_threads, max_threads>>>(d_z, z1, z2);
+		global_associate_electrons_with_cells<<<nelectrons/max_threads, max_threads>>>(d_z, d_lcell, 
+												d_rcell, ncells, 
+												d_cell_electron_association);
+		trace_electrons_single_step<<<nelectrons/max_threads, max_threads>>>(d_vx, d_vy, d_vz, 
+										     d_z, d_ex, 
+										     d_cell_electron_association, 
+										     fce, dt);		
+	}
 	
 	printf("The calculations are done!\n");
+	
 
 	printf("Save the data!\n");
+	cudaMemcpy(v, d_z, sizeof(float)*nelectrons, cudaMemcpyDeviceToHost);
 
-	cudaFree(d_vx);
-	cudaFree(d_vy);
-	cudaFree(d_vz);
-	cudaFree(d_ex);
-	cudaFree(d_lcell);
-	cudaFree(d_rcell);
+	to = fopen("z.dat", "w");
+	for (i = 0; i < nelectrons; ++i)
+	{
+		fprintf(to, "%e\n", v[i]); 
+	}
+	fclose(to);
 
+	CUDA_CALL(cudaFree(d_vx));
+	CUDA_CALL(cudaFree(d_vy));
+	CUDA_CALL(cudaFree(d_vz));
+	CUDA_CALL(cudaFree(d_z));
+	CUDA_CALL(cudaFree(d_ex));
+	CUDA_CALL(cudaFree(d_lcell));
+	CUDA_CALL(cudaFree(d_rcell));
+	CUDA_CALL(cudaFree(d_tn));
+	CUDA_CALL(cudaFree(d_am));
+	CUDA_CALL(cudaFree(d_fm));
+	CUDA_CALL(cudaFree(d_a));
+	CUDA_CALL(cudaFree(d_cell_electron_association));
+	free(v2);
+	free(v);
+
+	CURAND_CALL(curandDestroyGenerator(cuda_r));
 	config_destroy (&configuration);
 	printf("The programm is done!\n");
 }
