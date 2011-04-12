@@ -1,9 +1,11 @@
 ARCH=$(shell uname -m)
 ifeq ($(ARCH),i686)
         ARCHPREFIX=
+	ARCHPOSTFIX=i686	
         MACHINE=-m32
 else
         ARCHPREFIX=64
+	ARCHPOSTFIX=x86_64
         MACHINE=-m64
 endif
 
@@ -15,7 +17,7 @@ CUDPPINC = $(CUDPP_HOME)/cudpp/include/
 INCLUDE = -I$(HOMEDIR) \
           -I$(CUDPPINC)
 
-LIBS = -lcudpp_i686 -lconfig -lcurand -lcudart
+LIBS = -lcudpp_$(ARCHPOSTFIX) -lconfig -lcurand -lcudart
 harm : main.cu
 	$(CU) $(INCLUDE) -O2 -o harm  main.cu -L$(CUDPPLIB) $(LIBS)
 
