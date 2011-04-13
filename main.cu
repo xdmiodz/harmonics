@@ -6,6 +6,8 @@
 #include "curand.h"
 #include "curand_kernel.h"
 #include "linux/limits.h"
+#include "omp.h"
+#include "poisson1d.h"
 
 #define PI (3.14159265)
 #define EV_IN_ERGS (1.60217646e-12)
@@ -42,6 +44,7 @@ typedef struct simulation_str
 	long long ncells;
 	float z1;
 	float z2;
+	float plasma_density;
 }simulation_t;
 
 typedef struct electron_str
@@ -139,6 +142,8 @@ int get_simulation_config(config_t* config, simulation_t* simulation)
 	simulation->z1 = (float)config_setting_get_float(setting);
 	setting = config_lookup(config, "simulation.z2");
 	simulation->z2 = (float)config_setting_get_float(setting);
+	setting = config_lookup(config, "simulation.plasma_density");
+	simulation->plasma_density = (float)config_setting_get_float(setting);
 	return 0;
 }
 
@@ -290,7 +295,7 @@ __device__ void rotate_particle(float *vx, float* vy,  float E, float fce, float
 }
 
 __global__ void trace_electrons_single_step(float* d_vx, float* d_vy, float* d_vz,
-					    float* d_z, float* d_ex, long long* d_associate, 
+					    float* d_z, float* d_fx, float* d_fz, long long* d_associate, 
 					    float fce, float delta)
 {
 	long long n = blockDim.x*blockIdx.x + threadIdx.x;
@@ -299,10 +304,12 @@ __global__ void trace_electrons_single_step(float* d_vx, float* d_vy, float* d_v
 	float dt = delta;
 	float tfce = fce;
 	long long ncell = d_associate[n];
-	rotate_particle(&vxt, &vyt,  d_ex[ncell], tfce, dt);
+	rotate_particle(&vxt, &vyt,  d_fx[ncell], tfce, dt);
 	d_vx[n] = vxt;
 	d_vy[n] = vyt;
+	d_vz[n] += d_fz[ncell]*delta;
 	d_z[n] += d_vz[n]*dt; 
+	
 }
 
 __global__ void postproc(float* d_z, float* d_vx, float* d_vy, 
@@ -380,6 +387,48 @@ __global__ void setup_rstates(curandState* states, unsigned long rseed)
 	curand_init(rseed, n, 0, &states[n]);
 }
 
+__global__ void calculate_rho(long long* d_associate, long long* d_rho, long long nelectrons)
+{
+	long long ncell = blockDim.x*blockIdx.x + threadIdx.x;
+	long long i;
+	long long rho = 0;
+	for (i = 0; i < nelectrons; ++i)
+	{
+		if (d_associate[i]==ncell)
+		{
+			rho++;
+		}
+	}
+	d_rho[ncell] = rho;
+}
+
+void update_ez(poisson1d* poisson, long long* d_associate, long long* d_rho, 
+	       long long* rho, float* d_ez, float* ez, float* phi, 
+	       long long ncells, long long nelectrons, long long max_threads, float dcoeff,
+	       float cellsize, float q, float m)
+{
+	calculate_rho<<<ncells/max_threads, max_threads>>>(d_associate, d_rho, nelectrons);
+	CUDA_CALL(cudaMemcpy(rho, d_rho, sizeof(long long)*ncells, cudaMemcpyDeviceToHost));
+	float qm = q/m;
+	long long i;
+#pragma omp parallel for
+	for (i = 0; i < ncells; ++i)
+	{
+		ez[i] = (float)dcoeff*rho[i];
+	}
+	poisson1d_load_rho(poisson, ez);
+	poisson1d_calc_phi_from_rho(poisson);
+	poisson1d_unload_phi(poisson, phi);
+#pragma omp parallel for
+	for (i = 1; i < ncells - 1; ++i) 
+	{
+		ez[i]= -qm*(phi[i+1] - phi[i-1])/2/cellsize;
+	}
+	ez[0] = -qm*(phi[1]-phi[ncells-1])/2/cellsize;
+	ez[ncells-1] = -qm*(phi[0]-phi[ncells-2])/2/cellsize;
+	CUDA_CALL(cudaMemcpy(d_ez, ez, sizeof(float)*ncells, cudaMemcpyHostToDevice));
+}
+
 int main(int argc, char** argv)
 {
 	char* config_file = argv[1];
@@ -418,10 +467,12 @@ int main(int argc, char** argv)
 	float m = electron.m;
 	float Te = electron.T;
 	float sigma = sqrt(EV_IN_ERGS*Te/m);
+	float plasma_density = simulation.plasma_density;
 	float dt = (tstop - tstart)/ntpoints;
 	curandGenerator_t cuda_r;
 	char* filename = global_settings.save_file;
 	char* savedir = global_settings.savedir;
+	poisson1d poisson;
 
 	printf("Allocate memory\n");
 	
@@ -431,8 +482,7 @@ int main(int argc, char** argv)
 	CURAND_CALL(curandCreateGenerator(&cuda_r, CURAND_RNG_PSEUDO_DEFAULT));
         CURAND_CALL(curandSetPseudoRandomGeneratorSeed(cuda_r, rseed));
 
-	long long* cell_electron_association = (long long*)malloc(sizeof(long long)*nelectrons);
-	
+	poisson1d_init_fft(ncells, dz, &poisson);
 	float sample_dt = simulation.sample_dt;
 	float* d_vx = NULL;
 	float* d_vy = NULL;
@@ -448,6 +498,12 @@ int main(int argc, char** argv)
 	float* d_a = NULL;
 	float* d_m = NULL;
 	long long* d_n = NULL;
+	long long* d_rho;
+	long long* rho = (long long*)malloc(sizeof(long long)*ncells);
+	float* ez =  (float*)malloc(sizeof(float)*ncells);
+	float* phi =  (float*)malloc(sizeof(float)*ncells);
+	float* d_ez;
+	float density_simulation_coeff = q*plasma_density*(z2 - z1)/nelectrons/dz;
 
 	CUDA_CALL(cudaMalloc(&d_vx, sizeof(float)*nelectrons));
 	CUDA_CALL(cudaMalloc(&d_vy, sizeof(float)*nelectrons));
@@ -459,7 +515,9 @@ int main(int argc, char** argv)
 	CUDA_CALL(cudaMalloc(&d_fm, sizeof(float)*nh));
 	CUDA_CALL(cudaMalloc(&d_a, sizeof(float)*ntpoints));
 	CUDA_CALL(cudaMalloc(&d_m, sizeof(float)*ncells));
-	CUDA_CALL(cudaMalloc(&d_n, sizeof(long long)*ncells))
+	CUDA_CALL(cudaMalloc(&d_n, sizeof(long long)*ncells));
+	CUDA_CALL(cudaMalloc(&d_rho, sizeof(long long)*ncells));
+	CUDA_CALL(cudaMalloc(&d_ez, sizeof(float)*ncells));
 	CUDA_CALL(cudaMalloc(&d_cell_electron_association, sizeof(long long)*nelectrons));
 
 	printf("Preparing the initial data\n");
@@ -488,12 +546,16 @@ int main(int argc, char** argv)
 								     pulse_duration, 
 								     pulse_z0, pulse_dz, dz, 
 								     d_ex, q, m);
+	
 		postproc<<<nelectrons/max_threads, max_threads>>>(d_z, d_vx, d_vy, z1, z2, sigma, d_rstates);
 		global_associate_electrons_with_cells<<<nelectrons/max_threads, max_threads>>>(d_z,
 											       dz, 
 											       d_cell_electron_association);
+		update_ez(&poisson, d_cell_electron_association, d_rho, 
+			  rho, d_ez, ez, phi, ncells, nelectrons, max_threads, density_simulation_coeff,
+			  dz, q, m);
 		trace_electrons_single_step<<<nelectrons/max_threads, max_threads>>>(d_vx, d_vy, d_vz, 
-										     d_z, d_ex, 
+										     d_z, d_ex, d_ez, 
 										     d_cell_electron_association, 
 										     fce, dt);
 		if ((i%100) == 0)
@@ -506,6 +568,7 @@ int main(int argc, char** argv)
 
 
 	printf("The calculations are done!\n");
+	printf("Free the memory\n");
 
 	CUDA_CALL(cudaFree(d_vx));
 	CUDA_CALL(cudaFree(d_vy));
@@ -519,10 +582,15 @@ int main(int argc, char** argv)
 	CUDA_CALL(cudaFree(d_cell_electron_association));
 	CUDA_CALL(cudaFree(d_m));
 	CUDA_CALL(cudaFree(d_n));
+	CUDA_CALL(cudaFree(d_rho));
+	CUDA_CALL(cudaFree(d_ez));
 	CUDA_CALL(cudaFree(d_rstates));
 	free(n);
-	free(cell_electron_association);
+	free(rho);
+	free(ez);
+	free(phi);
 	CURAND_CALL(curandDestroyGenerator(cuda_r));
 	config_destroy (&configuration);
+	poisson1d_free_fft(&poisson);
 	printf("The programm is done!\n");
 }
