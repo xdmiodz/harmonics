@@ -4,6 +4,7 @@
 #include "cudpp.h"
 #include "libconfig.h"
 #include "curand.h"
+#include "curand_kernel.h"
 #include "linux/limits.h"
 
 #define PI (3.14159265)
@@ -304,18 +305,27 @@ __global__ void trace_electrons_single_step(float* d_vx, float* d_vy, float* d_v
 	d_z[n] += d_vz[n]*dt; 
 }
 
-__global__ void postproc(float* d_z, float zmin, float zmax)
+__global__ void postproc(float* d_z, float* d_vx, float* d_vy, 
+			 float zmin, float zmax, float sigma,  curandState* d_states)
 {
 	long long n = blockDim.x*blockIdx.x + threadIdx.x;
+	long long nr = threadIdx.x;
 	float L = zmax - zmin;
+	curandState rstate = d_states[nr];
 	if(d_z[n] > zmax)
 	{
 		d_z[n] -= L;
+		d_vx[n] = sigma*curand_uniform(&rstate);
+		d_vy[n] = sigma*curand_uniform(&rstate);
 	}
 	if(d_z[n] < zmin)
 	{
 		d_z[n] += L;
+		d_vx[n] = sigma*curand_normal(&rstate);
+		d_vy[n] = sigma*curand_normal(&rstate);
+	
 	}
+	d_states[nr]=rstate;
 }
 
 __global__ void calculate_momentum_zdistribution(float* d_vx, float* d_vy, 
@@ -364,6 +374,12 @@ void dump(char* savedir, char* filename, long long n, float* d_vx, float* d_vy,
 	printf("file %d dumped\n", n);
 }
 
+__global__ void setup_rstates(curandState* states, unsigned long rseed)
+{
+	size_t n = blockDim.x*blockIdx.x + threadIdx.x;
+	curand_init(rseed, n, 0, &states[n]);
+}
+
 int main(int argc, char** argv)
 {
 	char* config_file = argv[1];
@@ -406,6 +422,12 @@ int main(int argc, char** argv)
 	curandGenerator_t cuda_r;
 	char* filename = global_settings.save_file;
 	char* savedir = global_settings.savedir;
+
+	printf("Allocate memory\n");
+	
+	curandState* d_rstates;
+	CUDA_CALL(cudaMalloc(&d_rstates, sizeof(curandState)*max_threads));
+	setup_rstates<<<1,max_threads>>>(d_rstates, rseed);
 	CURAND_CALL(curandCreateGenerator(&cuda_r, CURAND_RNG_PSEUDO_DEFAULT));
         CURAND_CALL(curandSetPseudoRandomGeneratorSeed(cuda_r, rseed));
 
@@ -466,7 +488,7 @@ int main(int argc, char** argv)
 								     pulse_duration, 
 								     pulse_z0, pulse_dz, dz, 
 								     d_ex, q, m);
-		postproc<<<nelectrons/max_threads, max_threads>>>(d_z, z1, z2);
+		postproc<<<nelectrons/max_threads, max_threads>>>(d_z, d_vx, d_vy, z1, z2, sigma, d_rstates);
 		global_associate_electrons_with_cells<<<nelectrons/max_threads, max_threads>>>(d_z,
 											       dz, 
 											       d_cell_electron_association);
@@ -476,7 +498,7 @@ int main(int argc, char** argv)
 										     fce, dt);
 		if ((i%100) == 0)
 		{
-			dump(savedir, filename, i/100, d_vx, d_vy, d_cell_electron_association, d_m, 
+			dump(savedir, filename, i/100, d_vx, d_vy, d_cell_electron_association, d_m,
 			     d_n, nelectrons, ncells, m, dz, z1, dt, max_threads);
 		}
 	}
@@ -497,6 +519,7 @@ int main(int argc, char** argv)
 	CUDA_CALL(cudaFree(d_cell_electron_association));
 	CUDA_CALL(cudaFree(d_m));
 	CUDA_CALL(cudaFree(d_n));
+	CUDA_CALL(cudaFree(d_rstates));
 	free(n);
 	free(cell_electron_association);
 	CURAND_CALL(curandDestroyGenerator(cuda_r));
