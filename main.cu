@@ -35,11 +35,10 @@ typedef struct pulse_cfg_str
 
 typedef struct simulation_str
 {
-	float Tstart;
-	float Tstop;
-	float sample_dt;
+	float tstart;
+	float tstop;
 	long long nh;
-	long long ntpoints;
+	float dt;
 	long long nelectrons;
 	long long ncells;
 	float z1;
@@ -124,16 +123,14 @@ int get_global_config(config_t* config, global_setting_t* global_settings)
 
 int get_simulation_config(config_t* config, simulation_t* simulation)
 {
-	config_setting_t* setting = config_lookup(config, "simulation.Tstart");
-	simulation->Tstart = (float)config_setting_get_float(setting);
-	setting = config_lookup(config, "simulation.Tstop");
-	simulation->Tstop = (float)config_setting_get_float(setting);
-	setting = config_lookup(config, "simulation.dT");
-	simulation->sample_dt = (float)config_setting_get_float(setting);
+	config_setting_t* setting = config_lookup(config, "simulation.tstart");
+	simulation->tstart = (float)config_setting_get_float(setting);
+	setting = config_lookup(config, "simulation.tstop");
+	simulation->tstop = (float)config_setting_get_float(setting);
+	setting = config_lookup(config, "simulation.dt");
+	simulation->dt = (float)config_setting_get_float(setting);
 	setting = config_lookup(config, "simulation.nharm");
 	simulation->nh = config_setting_get_int64(setting);
-	setting = config_lookup(config, "simulation.ntpoints");
-	simulation->ntpoints = config_setting_get_int64(setting);
 	setting = config_lookup(config, "simulation.nelectrons");
 	simulation->nelectrons = config_setting_get_int64(setting);
 	setting = config_lookup(config, "simulation.ncells");
@@ -211,15 +208,15 @@ __global__ void kernel_generate_amfm(float am, float fm, float nh, float* d_fm, 
 	d_fm[i] = fm*(2*i + 1);	
 }
 
-__global__ void generate_ameandr(float* d_am, float* d_fm, float* tn,  long long nh, float* d_a)
+__global__ void generate_ameandr(float* d_am, float* d_fm, float t,  long long nh, float* d_a)
 {
-	long long n = blockDim.x*blockIdx.x + threadIdx.x;
 	long long i;
-	float t = tn[n];
+	float a = 0;
 	for (i = 0; i < nh; ++i)
 	{
-		d_a[n] += d_am[i]*sin(d_fm[i]*t);
+		a += d_am[i]*sin(d_fm[i]*t);
 	}
+	*d_a = a; 
 }
 
 void generate_en(float* an, float* fn, float fce,
@@ -259,17 +256,18 @@ __device__ float get_ex_field(float A0, float pulse_duration,
 	
 }
 
-__global__ void update_ex_field(float A0, float* d_am, float fce, float* tn, 
+__global__ void update_ex_field(float A0, float* d_am, float fce, float dt, 
 				long long nt, float pulse_duration, float z0, float pulse_dz, 
 				float cellsize, float* d_ex, float q, float m)
 {
 	long long n = blockDim.x*blockIdx.x + threadIdx.x;
         float z = (n + 0.5)*cellsize;
-	float sfce = sin(fce*tn[nt]);
+	float t = nt*dt;
+	float sfce = sin(fce*t);
 	float az = (fabs(z - z0) <= pulse_dz) ? 1 : 0; 
-	float at = (tn[nt] - pulse_duration) < 0 ? 1 : 0;
+	float at = (t - pulse_duration) < 0 ? 1 : 0;
 	//d_ex[n] = get_ex_field(A0, pulse_duration, z, nt, z0, dz, d_am, tn)*sfce*q/m;
-	d_ex[n] = at*az*0.5*(A0 + d_am[nt])*sfce*q/m;
+	d_ex[n] = at*az*0.5*(A0 + *d_am)*sfce*q/m;
 }
 
 __global__ void kernel_generate_tn(float tstart, float dt, float* d_tn)
@@ -295,7 +293,8 @@ __device__ void rotate_particle(float *vx, float* vy,  float E, float fce, float
 }
 
 __global__ void trace_electrons_single_step(float* d_vx, float* d_vy, float* d_vz,
-					    float* d_z, float* d_fx, float* d_fz, long long* d_associate, 
+					    float* d_z, float* d_fx, float* d_fz, 
+					    long long* d_associate, 
 					    float fce, float delta)
 {
 	long long n = blockDim.x*blockIdx.x + threadIdx.x;
@@ -322,8 +321,8 @@ __global__ void postproc(float* d_z, float* d_vx, float* d_vy,
 	if(d_z[n] > zmax)
 	{
 		d_z[n] -= L;
-		d_vx[n] = sigma*curand_uniform(&rstate);
-		d_vy[n] = sigma*curand_uniform(&rstate);
+		d_vx[n] = sigma*curand_normal(&rstate);
+		d_vy[n] = sigma*curand_normal(&rstate);
 	}
 	if(d_z[n] < zmin)
 	{
@@ -452,9 +451,10 @@ int main(int argc, char** argv)
 	float pulse_dz = pulse.dz;
 	float pulse_z0 = pulse.z0;
 	long long nh  = simulation.nh;
-	float tstart = simulation.Tstart;
-	float tstop = simulation.Tstop;
-	long long ntpoints = simulation.ntpoints;
+	float tstart = simulation.tstart;
+	float tstop = simulation.tstop;
+	float dt = simulation.dt;
+	long long ntpoints = ceil((tstop-tstart)/dt);
 	float pulse_duration = pulse.T;
 	long long ncells = simulation.ncells;
 	long long nelectrons = simulation.nelectrons;
@@ -468,7 +468,6 @@ int main(int argc, char** argv)
 	float Te = electron.T;
 	float sigma = sqrt(EV_IN_ERGS*Te/m);
 	float plasma_density = simulation.plasma_density;
-	float dt = (tstop - tstart)/ntpoints;
 	curandGenerator_t cuda_r;
 	char* filename = global_settings.save_file;
 	char* savedir = global_settings.savedir;
@@ -483,14 +482,12 @@ int main(int argc, char** argv)
         CURAND_CALL(curandSetPseudoRandomGeneratorSeed(cuda_r, rseed));
 
 	poisson1d_init_fft(ncells, dz, &poisson);
-	float sample_dt = simulation.sample_dt;
 	float* d_vx = NULL;
 	float* d_vy = NULL;
 	float* d_vz = NULL;
 	float* d_z = NULL;
 	float* d_ex = NULL;
 	long long* d_cell_electron_association = NULL;
-	float* d_tn = NULL;
 
 	long long* n = (long long*)malloc(sizeof(long long)*ncells);
 	float* d_am = NULL;
@@ -509,11 +506,10 @@ int main(int argc, char** argv)
 	CUDA_CALL(cudaMalloc(&d_vy, sizeof(float)*nelectrons));
 	CUDA_CALL(cudaMalloc(&d_vz, sizeof(float)*nelectrons));
 	CUDA_CALL(cudaMalloc(&d_z, sizeof(float)*nelectrons));
-	CUDA_CALL(cudaMalloc(&d_tn, sizeof(float)*ntpoints));
 	CUDA_CALL(cudaMalloc(&d_ex, sizeof(float)*ncells));
 	CUDA_CALL(cudaMalloc(&d_am, sizeof(float)*nh));
 	CUDA_CALL(cudaMalloc(&d_fm, sizeof(float)*nh));
-	CUDA_CALL(cudaMalloc(&d_a, sizeof(float)*ntpoints));
+	CUDA_CALL(cudaMalloc(&d_a, sizeof(float)));
 	CUDA_CALL(cudaMalloc(&d_m, sizeof(float)*ncells));
 	CUDA_CALL(cudaMalloc(&d_n, sizeof(long long)*ncells));
 	CUDA_CALL(cudaMalloc(&d_rho, sizeof(long long)*ncells));
@@ -522,18 +518,15 @@ int main(int argc, char** argv)
 
 	printf("Preparing the initial data\n");
 
-	CUDA_CALL(cudaMemset(d_a, 0, sizeof(float)*ntpoints));
 	CUDA_CALL(cudaMemset(d_n, 0, sizeof(float)*ncells));
 	CUDA_CALL(cudaMemset(d_m, 0, sizeof(float)*ncells));
 	
-	kernel_generate_tn<<<ntpoints/max_threads, max_threads>>>(tstart, dt, d_tn); 
 	kernel_generate_amfm<<<1,nh>>>(Am, fm, nh, d_fm, d_am);
-	generate_ameandr<<<ntpoints/max_threads, max_threads>>>(d_am, d_fm, d_tn,  nh, d_a);
+
 	set_speed_maxwell_cuda(cuda_r, d_vx, sigma, nelectrons);
 	set_speed_maxwell_cuda(cuda_r, d_vy, sigma, nelectrons);
 	set_speed_maxwell_cuda(cuda_r, d_vz, sigma, nelectrons);
 	set_pos_uniform_cuda(cuda_r, d_z, z1, z2, nelectrons, max_threads);
-	
 	long long i = 0;	
 		
 	printf("Start the calculations!\n");
@@ -542,7 +535,8 @@ int main(int argc, char** argv)
 	for(i = 0; i < ntpoints; ++i)
 	{
 		//printf("cycle number: %i\n", i);
-		update_ex_field<<<ncells/max_threads, max_threads>>>(A0, d_a, fce, d_tn, i, 
+		generate_ameandr<<<1, 1>>>(d_am, d_fm, i*dt,  nh, d_a);
+		update_ex_field<<<ncells/max_threads, max_threads>>>(A0, d_a, fce, dt, i, 
 								     pulse_duration, 
 								     pulse_z0, pulse_dz, dz, 
 								     d_ex, q, m);
@@ -552,7 +546,8 @@ int main(int argc, char** argv)
 											       dz, 
 											       d_cell_electron_association);
 		update_ez(&poisson, d_cell_electron_association, d_rho, 
-			  rho, d_ez, ez, phi, ncells, nelectrons, max_threads, density_simulation_coeff,
+			  rho, d_ez, ez, phi, ncells, nelectrons, max_threads, 
+			  density_simulation_coeff,
 			  dz, q, m);
 		trace_electrons_single_step<<<nelectrons/max_threads, max_threads>>>(d_vx, d_vy, d_vz, 
 										     d_z, d_ex, d_ez, 
@@ -575,7 +570,6 @@ int main(int argc, char** argv)
 	CUDA_CALL(cudaFree(d_vz));
 	CUDA_CALL(cudaFree(d_z));
 	CUDA_CALL(cudaFree(d_ex));
-	CUDA_CALL(cudaFree(d_tn));
 	CUDA_CALL(cudaFree(d_am));
 	CUDA_CALL(cudaFree(d_fm));
 	CUDA_CALL(cudaFree(d_a));
