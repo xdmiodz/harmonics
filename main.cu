@@ -1,13 +1,11 @@
 #include "stdlib.h"
 #include "math.h"
 #include "stdio.h"
-#include "cudpp.h"
 #include "libconfig.h"
 #include "curand.h"
 #include "curand_kernel.h"
 #include "linux/limits.h"
-#include "omp.h"
-#include "poisson1d.h"
+#include "cufft.h"
 
 #define PI (3.14159265)
 #define EV_IN_ERGS (1.60217646e-12)
@@ -62,6 +60,19 @@ typedef struct global_settings_str
 	long long max_gpu_threads;
 	long long rseed;
 }global_setting_t;
+
+
+__device__ float diff(float k, float dx)
+{
+    float a = k * dx;
+    return sin(a)/a;
+}
+
+__device__ float diff2(float k, float dx)
+{
+    float a = diff(k, dx);
+    return a*a;
+}
 
 void set_speed_maxwell_cuda(curandGenerator_t cuda_r, float* d_v, float sigma, long long nelectrons)
 {
@@ -382,7 +393,7 @@ void dump(char* savedir, char* filename, long long n, float* d_vx, float* d_vy,
 
 __global__ void setup_rstates(curandState* states, unsigned long rseed)
 {
-	size_t n = blockDim.x*blockIdx.x + threadIdx.x;
+	long long n = blockDim.x*blockIdx.x + threadIdx.x;
 	curand_init(rseed, n, 0, &states[n]);
 }
 
@@ -401,33 +412,76 @@ __global__ void calculate_rho(long long* d_associate, long long* d_rho, long lon
 	d_rho[ncell] = rho;
 }
 
-void update_ez(poisson1d* poisson, long long* d_associate, long long* d_rho, 
-	       long long* rho, float* d_ez, float* ez, float* phi, 
-	       long long ncells, long long nelectrons, long long max_threads, float dcoeff,
-	       float cellsize, float q, float m)
+__global__ void generate_kn(float k0, float dx, float* d_k)
 {
-	calculate_rho<<<ncells/max_threads, max_threads>>>(d_associate, d_rho, nelectrons);
-	CUDA_CALL(cudaMemcpy(rho, d_rho, sizeof(long long)*ncells, cudaMemcpyDeviceToHost));
-	float qm = q/m;
-	long long i;
-#pragma omp parallel for
-	for (i = 0; i < ncells; ++i)
-	{
-		ez[i] = (float)dcoeff*rho[i];
-	}
-	poisson1d_load_rho(poisson, ez);
-	poisson1d_calc_phi_from_rho(poisson);
-	poisson1d_unload_phi(poisson, phi);
-#pragma omp parallel for
-	for (i = 1; i < ncells - 1; ++i) 
-	{
-		ez[i]= -qm*(phi[i+1] - phi[i-1])/2/cellsize;
-	}
-	ez[0] = -qm*(phi[1]-phi[ncells-1])/2/cellsize;
-	ez[ncells-1] = -qm*(phi[0]-phi[ncells-2])/2/cellsize;
-	CUDA_CALL(cudaMemcpy(d_ez, ez, sizeof(float)*ncells, cudaMemcpyHostToDevice));
+	long long n = blockDim.x*blockIdx.x + threadIdx.x;
+	float k = k0*(n+1);
+	d_k[n] = k*k*diff2(k,dx/2);
 }
 
+__global__ void copy_rho_to_cufft(long long* d_rho, cufftComplex* data, float coeff)
+{
+	long long n = blockDim.x*blockIdx.x + threadIdx.x;
+	data[n] = make_cuFloatComplex (coeff*(float)d_rho[n],0);
+}
+
+__global__ void copy_cufft_to_phi(float* d_phi, cufftComplex* data)
+{
+	long long n = blockDim.x*blockIdx.x + threadIdx.x;
+	cufftComplex thisd = data[n];
+	d_phi[n] = cuCrealf(thisd);
+}
+
+__global__ void poisson_harmonics_transform(float* d_k, cufftComplex* data, long long nharm)
+{
+	long long n = blockDim.x*blockIdx.x + threadIdx.x;
+	cufftComplex thisd = data[n+1];
+	float r;
+	float i;
+	r = 4*PI*cuCrealf(thisd)/d_k[n];
+	i = 4*PI*cuCimagf(thisd)/d_k[n];
+	data[n+1] =  make_cuFloatComplex (r,i);
+	data[nharm/2 + n] = cuConjf(data[nharm/2 - n]);
+}
+
+__global__ void zero_harm_hack_for_fftdata(cufftComplex* data)
+{
+	data[0] =  make_cuFloatComplex(0,0);
+}
+
+__global__ void calculate_ez_cuda(float* d_phi, float* d_ez, long long ncells, float q, float m, float cellsize)
+{
+	
+	long long n = blockDim.x*blockIdx.x + threadIdx.x;
+	long long nl = n - 1;
+	long long nr = n + 1;
+	float qm = q/m;
+	if (n==0)
+	{
+		nl = ncells-1;
+		nr = 1;
+	}
+	if (n==ncells-1)
+	{
+		nl = ncells-2;
+		nr = 0;
+	}
+	d_ez[n]= -qm*(d_phi[nr] - d_phi[nl])/2/cellsize/ncells;
+}
+
+void update_ez_cuda(cufftHandle plan, long long* d_rho, float* d_k, float* d_ez, float* d_phi, 
+		    cufftComplex* data, long long ncells, long long max_threads, 
+		    float dens_coeff, float q, float m, float cellsize)
+{
+	copy_rho_to_cufft<<<ncells/max_threads, max_threads>>>(d_rho, data, dens_coeff);
+	cufftExecC2C(plan, data, data, CUFFT_FORWARD);
+	poisson_harmonics_transform<<<ncells/max_threads/2, max_threads>>>(d_k, data, ncells);
+	zero_harm_hack_for_fftdata<<<1,1>>>(data);
+	cufftExecC2C(plan, data, data, CUFFT_INVERSE);
+	copy_cufft_to_phi<<<ncells/max_threads, max_threads>>>(d_phi, data);
+	calculate_ez_cuda<<<ncells/max_threads, max_threads>>>(d_phi, d_ez, ncells, q,m, cellsize);
+	
+}
 int main(int argc, char** argv)
 {
 	char* config_file = argv[1];
@@ -471,7 +525,6 @@ int main(int argc, char** argv)
 	curandGenerator_t cuda_r;
 	char* filename = global_settings.save_file;
 	char* savedir = global_settings.savedir;
-	poisson1d poisson;
 
 	printf("Allocate memory\n");
 	
@@ -481,7 +534,6 @@ int main(int argc, char** argv)
 	CURAND_CALL(curandCreateGenerator(&cuda_r, CURAND_RNG_PSEUDO_DEFAULT));
         CURAND_CALL(curandSetPseudoRandomGeneratorSeed(cuda_r, rseed));
 
-	poisson1d_init_fft(ncells, dz, &poisson);
 	float* d_vx = NULL;
 	float* d_vy = NULL;
 	float* d_vz = NULL;
@@ -496,11 +548,16 @@ int main(int argc, char** argv)
 	float* d_m = NULL;
 	long long* d_n = NULL;
 	long long* d_rho;
-	long long* rho = (long long*)malloc(sizeof(long long)*ncells);
 	float* ez =  (float*)malloc(sizeof(float)*ncells);
-	float* phi =  (float*)malloc(sizeof(float)*ncells);
 	float* d_ez;
+	float* d_phi;
 	float density_simulation_coeff = q*plasma_density*(z2 - z1)/nelectrons/dz;
+	float* d_k;
+	cufftComplex *d_fft_data;
+	cufftHandle plan;
+
+	CUDA_CALL(cudaMalloc((void**)&d_fft_data, sizeof(cufftComplex)*ncells));
+	cufftPlan1d(&plan, ncells, CUFFT_C2C, 1);
 
 	CUDA_CALL(cudaMalloc(&d_vx, sizeof(float)*nelectrons));
 	CUDA_CALL(cudaMalloc(&d_vy, sizeof(float)*nelectrons));
@@ -514,12 +571,15 @@ int main(int argc, char** argv)
 	CUDA_CALL(cudaMalloc(&d_n, sizeof(long long)*ncells));
 	CUDA_CALL(cudaMalloc(&d_rho, sizeof(long long)*ncells));
 	CUDA_CALL(cudaMalloc(&d_ez, sizeof(float)*ncells));
+	CUDA_CALL(cudaMalloc(&d_phi, sizeof(float)*ncells));
+	CUDA_CALL(cudaMalloc(&d_k, sizeof(float)*ncells/2));
 	CUDA_CALL(cudaMalloc(&d_cell_electron_association, sizeof(long long)*nelectrons));
 
 	printf("Preparing the initial data\n");
 
 	CUDA_CALL(cudaMemset(d_n, 0, sizeof(float)*ncells));
 	CUDA_CALL(cudaMemset(d_m, 0, sizeof(float)*ncells));
+	CUDA_CALL(cudaMemset(d_ez, 0, sizeof(float)*ncells));
 	
 	kernel_generate_amfm<<<1,nh>>>(Am, fm, nh, d_fm, d_am);
 
@@ -527,13 +587,16 @@ int main(int argc, char** argv)
 	set_speed_maxwell_cuda(cuda_r, d_vy, sigma, nelectrons);
 	set_speed_maxwell_cuda(cuda_r, d_vz, sigma, nelectrons);
 	set_pos_uniform_cuda(cuda_r, d_z, z1, z2, nelectrons, max_threads);
+	generate_kn<<<ncells/max_threads/2, max_threads>>>(2*PI/(z2-z1), dz, d_k);
+	
 	long long i = 0;	
 		
 	printf("Start the calculations!\n");
+	
 		
-
 	for(i = 0; i < ntpoints; ++i)
 	{
+	
 		//printf("cycle number: %i\n", i);
 		generate_ameandr<<<1, 1>>>(d_am, d_fm, i*dt,  nh, d_a);
 		update_ex_field<<<ncells/max_threads, max_threads>>>(A0, d_a, fce, dt, i, 
@@ -545,10 +608,10 @@ int main(int argc, char** argv)
 		global_associate_electrons_with_cells<<<nelectrons/max_threads, max_threads>>>(d_z,
 											       dz, 
 											       d_cell_electron_association);
-		update_ez(&poisson, d_cell_electron_association, d_rho, 
-			  rho, d_ez, ez, phi, ncells, nelectrons, max_threads, 
-			  density_simulation_coeff,
-			  dz, q, m);
+		calculate_rho<<<ncells/max_threads, max_threads>>>(d_cell_electron_association, d_rho, nelectrons);
+		update_ez_cuda(plan, d_rho, d_k, d_ez, d_phi, d_fft_data, ncells, 
+			       max_threads, density_simulation_coeff,q,m,dz );
+	
 		trace_electrons_single_step<<<nelectrons/max_threads, max_threads>>>(d_vx, d_vy, d_vz, 
 										     d_z, d_ex, d_ez, 
 										     d_cell_electron_association, 
@@ -559,7 +622,6 @@ int main(int argc, char** argv)
 			     d_n, nelectrons, ncells, m, dz, z1, dt, max_threads);
 		}
 	}
-
 
 
 	printf("The calculations are done!\n");
@@ -579,12 +641,12 @@ int main(int argc, char** argv)
 	CUDA_CALL(cudaFree(d_rho));
 	CUDA_CALL(cudaFree(d_ez));
 	CUDA_CALL(cudaFree(d_rstates));
+	CUDA_CALL(cudaFree(d_fft_data));
+	CUDA_CALL(cudaFree(d_phi));
 	free(n);
-	free(rho);
 	free(ez);
-	free(phi);
+	cufftDestroy(plan);
 	CURAND_CALL(curandDestroyGenerator(cuda_r));
 	config_destroy (&configuration);
-	poisson1d_free_fft(&poisson);
 	printf("The programm is done!\n");
 }

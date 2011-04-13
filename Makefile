@@ -14,18 +14,13 @@ CU = /usr/local/cuda/bin/nvcc
 CUDPPLIB = $(CUDPP_HOME)/lib
 CUDPPINC = $(CUDPP_HOME)/cudpp/include/
 
-OMP=-fopenmp
-XCOMPILER = -Xcompiler $(OMP)
 
 INCLUDE = -I$(HOMEDIR) \
           -I$(CUDPPINC)
 
-LIBS = -lcudpp_$(ARCHPOSTFIX) -lconfig -lcurand -lcudart -lgsl -lgslcblas -lm
-harm : main.cu poisson1d.o
-	$(CU) $(INCLUDE) -O2 -o harm  poisson1d.o main.cu  -L$(CUDPPLIB) $(LIBS) $(XCOMPILER)
+LIBS = -lcudpp_$(ARCHPOSTFIX) -lconfig -lcurand -lcudart -lcufft
+harm : main.cu 
+	$(CU) $(INCLUDE) -O2 -o harm  main.cu  -L$(CUDPPLIB) $(LIBS)
 
-harm_debug : main.cu poisson1d.o
-	$(CU) $(INCLUDE) -g -o harm poisson1d.o main.cu -L$(CUDPPLIB) $(LIBS)
-
-poisson1d.o : poisson1d.cu
-	$(CU) $(INCLUDE) -c -o poisson1d.o poisson1d.cu
+harm_debug : main.cu
+	$(CU) $(INCLUDE) -g -o harm  main.cu -L$(CUDPPLIB) $(LIBS)
