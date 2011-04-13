@@ -4,6 +4,7 @@
 #include "cudpp.h"
 #include "libconfig.h"
 #include "curand.h"
+#include "linux/limits.h"
 
 #define PI (3.14159265)
 #define EV_IN_ERGS (1.60217646e-12)
@@ -53,8 +54,10 @@ electron_t;
 
 typedef struct global_settings_str
 {
-	char* v_save_file;
+	char* save_file;
+	char* savedir;
 	long long max_gpu_threads;
+	long long rseed;
 }global_setting_t;
 
 void set_speed_maxwell_cuda(curandGenerator_t cuda_r, float* d_v, float sigma, long long nelectrons)
@@ -105,9 +108,13 @@ int get_pulse_config(config_t* config, pulse_t* pulse)
 int get_global_config(config_t* config, global_setting_t* global_settings)
 {
 	config_setting_t* setting = config_lookup(config, "global.filename");
-	global_settings->v_save_file = (char*)config_setting_get_string(setting);	
+	global_settings->save_file = (char*)config_setting_get_string(setting);	
 	setting = config_lookup(config, "global.max_gpu_threads");
 	global_settings->max_gpu_threads = config_setting_get_int64(setting);
+	setting = config_lookup(config, "global.savedir");
+	global_settings->savedir = (char*)config_setting_get_string(setting);
+	setting = config_lookup(config, "global.rseed");
+	global_settings->rseed = config_setting_get_int64(setting);
 	return 0;
 }
 
@@ -253,10 +260,10 @@ __global__ void update_ex_field(float A0, float* d_am, float fce, float* tn,
 	long long n = blockDim.x*blockIdx.x + threadIdx.x;
         float z = (n + 0.5)*cellsize;
 	float sfce = sin(fce*tn[nt]);
-	float az = (fabs(z - 50.0) <= 0.5) ? 1 : 0; 
+	float az = (fabs(z - z0) <= pulse_dz) ? 1 : 0; 
 	float at = (tn[nt] - pulse_duration) < 0 ? 1 : 0;
 	//d_ex[n] = get_ex_field(A0, pulse_duration, z, nt, z0, dz, d_am, tn)*sfce*q/m;
-	d_ex[n] = at*az*A0*sfce*q/m;
+	d_ex[n] = at*az*0.5*(A0 + d_am[nt])*sfce*q/m;
 }
 
 __global__ void kernel_generate_tn(float tstart, float dt, float* d_tn)
@@ -334,6 +341,28 @@ __global__ void calculate_momentum_zdistribution(float* d_vx, float* d_vy,
 	d_m[ncell] = 0.5*mass*m/ne;
 }
 
+void dump(char* savedir, char* filename, long long n, float* d_vx, float* d_vy, 
+	  long long*  d_cell_electron_association, float* d_m, long long* d_n, 
+	  long long nelectrons, long long ncells, float m, float cellsize, float z1, float dt, 
+	  long long max_threads)
+{
+	FILE* to;
+	float* momentum = (float*)malloc(sizeof(float)*ncells);
+	long long i;
+	char filenamei[PATH_MAX];
+	sprintf(filenamei, "%s/%s_%d.dat", savedir, filename, n);
+	to = fopen(filenamei, "w");
+	calculate_momentum_zdistribution<<<ncells/max_threads, max_threads>>>(d_vx, d_vy, d_cell_electron_association, d_m, d_n, nelectrons, m);
+	cudaMemcpy(momentum, d_m, sizeof(float)*ncells, cudaMemcpyDeviceToHost);
+	
+	for (i = 0; i < ncells; ++i)
+	{
+		fprintf(to, "%e\t%e\n", z1 + (i+0.5)*cellsize,  momentum[i]);
+	}
+	free(momentum);
+	fclose(to);
+	printf("file %d dumped\n", n);
+}
 
 int main(int argc, char** argv)
 {
@@ -365,6 +394,7 @@ int main(int argc, char** argv)
 	long long ncells = simulation.ncells;
 	long long nelectrons = simulation.nelectrons;
 	long long max_threads = global_settings.max_gpu_threads;
+	long long rseed = global_settings.rseed;
 	float z1 = simulation.z1;
 	float z2 = simulation.z2;
 	float dz = (z2-z1)/ncells;
@@ -374,8 +404,10 @@ int main(int argc, char** argv)
 	float sigma = sqrt(EV_IN_ERGS*Te/m);
 	float dt = (tstop - tstart)/ntpoints;
 	curandGenerator_t cuda_r;
+	char* filename = global_settings.save_file;
+	char* savedir = global_settings.savedir;
 	CURAND_CALL(curandCreateGenerator(&cuda_r, CURAND_RNG_PSEUDO_DEFAULT));
-        CURAND_CALL(curandSetPseudoRandomGeneratorSeed(cuda_r, 5678ULL));
+        CURAND_CALL(curandSetPseudoRandomGeneratorSeed(cuda_r, rseed));
 
 	long long* cell_electron_association = (long long*)malloc(sizeof(long long)*nelectrons);
 	
@@ -387,7 +419,7 @@ int main(int argc, char** argv)
 	float* d_ex = NULL;
 	long long* d_cell_electron_association = NULL;
 	float* d_tn = NULL;
-	float* momentum = (float*)malloc(sizeof(float)*ncells);
+
 	long long* n = (long long*)malloc(sizeof(long long)*ncells);
 	float* d_am = NULL;
 	float* d_fm = NULL;
@@ -422,8 +454,7 @@ int main(int argc, char** argv)
 	set_speed_maxwell_cuda(cuda_r, d_vz, sigma, nelectrons);
 	set_pos_uniform_cuda(cuda_r, d_z, z1, z2, nelectrons, max_threads);
 	
-	long long i = 0;
-	FILE* to;	
+	long long i = 0;	
 		
 	printf("Start the calculations!\n");
 		
@@ -442,30 +473,17 @@ int main(int argc, char** argv)
 		trace_electrons_single_step<<<nelectrons/max_threads, max_threads>>>(d_vx, d_vy, d_vz, 
 										     d_z, d_ex, 
 										     d_cell_electron_association, 
-										     fce, dt);	
+										     fce, dt);
+		if ((i%100) == 0)
+		{
+			dump(savedir, filename, i/100, d_vx, d_vy, d_cell_electron_association, d_m, 
+			     d_n, nelectrons, ncells, m, dz, z1, dt, max_threads);
+		}
 	}
 
 
 
 	printf("The calculations are done!\n");
-	
-	postproc<<<nelectrons/max_threads, max_threads>>>(d_z, z1, z2);
-	global_associate_electrons_with_cells<<<nelectrons/max_threads, max_threads>>>(d_z,
-										       dz, 
-										       d_cell_electron_association);
-
-	calculate_momentum_zdistribution<<<ncells/max_threads, max_threads>>>(d_vx, d_vy, d_cell_electron_association, d_m, d_n, nelectrons, m);
-
-	printf("Save the data!\n");
-	cudaMemcpy(momentum, d_m, sizeof(float)*ncells, cudaMemcpyDeviceToHost);
-	cudaMemcpy(n, d_n, sizeof(long long)*ncells, cudaMemcpyDeviceToHost);
-
-	to = fopen("m.dat", "w");
-	for (i = 0; i < ncells; ++i)
-	{
-		fprintf(to, "%i\t%e\n", n[i], momentum[i]/EV_IN_ERGS); 
-	}
-	fclose(to);
 
 	CUDA_CALL(cudaFree(d_vx));
 	CUDA_CALL(cudaFree(d_vy));
@@ -480,7 +498,6 @@ int main(int argc, char** argv)
 	CUDA_CALL(cudaFree(d_m));
 	CUDA_CALL(cudaFree(d_n));
 	free(n);
-	free(momentum);
 	free(cell_electron_association);
 	CURAND_CALL(curandDestroyGenerator(cuda_r));
 	config_destroy (&configuration);
