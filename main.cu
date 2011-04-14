@@ -1,10 +1,12 @@
 #include "stdlib.h"
+#include "cudpp.h"
 #include "math.h"
 #include "stdio.h"
 #include "libconfig.h"
 #include "curand.h"
 #include "curand_kernel.h"
 #include "linux/limits.h"
+#include "limits.h"
 #include "cufft.h"
 
 #define PI (3.14159265)
@@ -35,13 +37,14 @@ typedef struct simulation_str
 {
 	float tstart;
 	float tstop;
-	long long nh;
+	unsigned int nh;
 	float dt;
-	long long nelectrons;
-	long long ncells;
+	unsigned int nelectrons;
+	unsigned int ncells;
 	float z1;
 	float z2;
 	float plasma_density;
+	int static_ez;
 }simulation_t;
 
 typedef struct electron_str
@@ -57,8 +60,8 @@ typedef struct global_settings_str
 {
 	char* save_file;
 	char* savedir;
-	long long max_gpu_threads;
-	long long rseed;
+	unsigned int max_gpu_threads;
+	unsigned int rseed;
 }global_setting_t;
 
 
@@ -74,26 +77,26 @@ __device__ float diff2(float k, float dx)
     return a*a;
 }
 
-void set_speed_maxwell_cuda(curandGenerator_t cuda_r, float* d_v, float sigma, long long nelectrons)
+void set_speed_maxwell_cuda(curandGenerator_t cuda_r, float* d_v, float sigma, unsigned int nelectrons)
 {
 	CURAND_CALL(curandGenerateNormal(cuda_r, d_v, nelectrons, 0, sigma));
 }
 
 __global__ void transform_uniform_distribution(float* d_p, float min,  float max)
 {
-    long long n = blockDim.x*blockIdx.x + threadIdx.x;
+    unsigned int n = blockDim.x*blockIdx.x + threadIdx.x;
     d_p[n] = (max - min)*d_p[n] + min;
 }
 
-void set_pos_uniform_cuda(curandGenerator_t cuda_r, float* d_r, float z1, float z2, long long nelectrons, long long max_threads)
+void set_pos_uniform_cuda(curandGenerator_t cuda_r, float* d_r, float z1, float z2, unsigned int nelectrons, unsigned int max_threads)
 {
 	CURAND_CALL(curandGenerateUniform(cuda_r, d_r, nelectrons));
 	transform_uniform_distribution<<<nelectrons/max_threads, max_threads>>>(d_r, z1, z2);
 }
 
-void calculate_v2(float* vx, float* vy, long long ntpoints, float* v)
+void calculate_v2(float* vx, float* vy, unsigned int ntpoints, float* v)
 {
-	long long i;
+	unsigned int i;
 	for (i = 0; i < ntpoints; ++i)
 	{
 		v[i] = vx[i]*vx[i] + vy[i]*vy[i];
@@ -124,11 +127,11 @@ int get_global_config(config_t* config, global_setting_t* global_settings)
 	config_setting_t* setting = config_lookup(config, "global.filename");
 	global_settings->save_file = (char*)config_setting_get_string(setting);	
 	setting = config_lookup(config, "global.max_gpu_threads");
-	global_settings->max_gpu_threads = config_setting_get_int64(setting);
+	global_settings->max_gpu_threads = (unsigned int)config_setting_get_int64(setting);
 	setting = config_lookup(config, "global.savedir");
 	global_settings->savedir = (char*)config_setting_get_string(setting);
 	setting = config_lookup(config, "global.rseed");
-	global_settings->rseed = config_setting_get_int64(setting);
+	global_settings->rseed = (unsigned int)config_setting_get_int64(setting);
 	return 0;
 }
 
@@ -141,17 +144,19 @@ int get_simulation_config(config_t* config, simulation_t* simulation)
 	setting = config_lookup(config, "simulation.dt");
 	simulation->dt = (float)config_setting_get_float(setting);
 	setting = config_lookup(config, "simulation.nharm");
-	simulation->nh = config_setting_get_int64(setting);
+	simulation->nh = (unsigned int)config_setting_get_int64(setting);
 	setting = config_lookup(config, "simulation.nelectrons");
-	simulation->nelectrons = config_setting_get_int64(setting);
+	simulation->nelectrons = (unsigned int)config_setting_get_int64(setting);
 	setting = config_lookup(config, "simulation.ncells");
-	simulation->ncells = config_setting_get_int64(setting);
+	simulation->ncells = (unsigned int)config_setting_get_int64(setting);
 	setting = config_lookup(config, "simulation.z1");
 	simulation->z1 = (float)config_setting_get_float(setting);
 	setting = config_lookup(config, "simulation.z2");
 	simulation->z2 = (float)config_setting_get_float(setting);
 	setting = config_lookup(config, "simulation.plasma_density");
 	simulation->plasma_density = (float)config_setting_get_float(setting);
+	setting = config_lookup(config, "simulation.static_ez");
+	simulation->static_ez = config_setting_get_bool(setting);
 	return 0;
 }
 
@@ -189,11 +194,11 @@ __device__  float kernel_cosp(float fn, float fce, float t)
 }
 
 
-__global__ void global_calculate_et(float* fn, float* fce, float* enp, float* enm, long long nh, float* tn, float* et)
+__global__ void global_calculate_et(float* fn, float* fce, float* enp, float* enm, unsigned int nh, float* tn, float* et)
 {      
-	long long nt = blockDim.x*blockIdx.x + threadIdx.x;
+	unsigned int nt = blockDim.x*blockIdx.x + threadIdx.x;
 	float t = tn[nt];
-	long long i;
+	unsigned int i;
 	float kfce = *fce;
 	float cosp;
 	float cosm;
@@ -214,14 +219,14 @@ __global__ void global_calculate_et(float* fn, float* fce, float* enp, float* en
 
 __global__ void kernel_generate_amfm(float am, float fm, float nh, float* d_fm, float* d_am)
 {
-	long long i = blockDim.x*blockIdx.x + threadIdx.x;
+	unsigned int i = blockDim.x*blockIdx.x + threadIdx.x;
 	d_am[i] = 4*am/PI/(2*i + 1);
 	d_fm[i] = fm*(2*i + 1);	
 }
 
-__global__ void generate_ameandr(float* d_am, float* d_fm, float t,  long long nh, float* d_a)
+__global__ void generate_ameandr(float* d_am, float* d_fm, float t,  unsigned int nh, float* d_a)
 {
-	long long i;
+	unsigned int i;
 	float a = 0;
 	for (i = 0; i < nh; ++i)
 	{
@@ -231,9 +236,9 @@ __global__ void generate_ameandr(float* d_am, float* d_fm, float t,  long long n
 }
 
 void generate_en(float* an, float* fn, float fce,
-		 long long nh, float* enp, float* enm)
+		 unsigned int nh, float* enp, float* enm)
 {
-	long long i;
+	unsigned int i;
 	for (i = 0; i < nh; ++i)
 	{     
 		enm[i] = 0.5*an[i];
@@ -249,15 +254,15 @@ int my_read_config_file(char* file, config_t* config)
 }
 
 
-__global__ void global_associate_electrons_with_cells(float* d_z, float cellsize, long long* d_association)
+__global__ void global_associate_electrons_with_cells(float* d_z, float cellsize, unsigned int* d_association)
 {
-	long long n = blockDim.x*blockIdx.x + threadIdx.x;
-	long long ncell = floor(d_z[n]/cellsize);
+	unsigned int n = blockDim.x*blockIdx.x + threadIdx.x;
+	unsigned int ncell = floor(d_z[n]/cellsize);
 	d_association[n] = ncell;
 }
 
 __device__ float get_ex_field(float A0, float pulse_duration, 
-			      float z, long long nt, 
+			      float z, unsigned int nt, 
 			      float z0, float dz,
 			      float* am, float* tn)
 {
@@ -268,10 +273,10 @@ __device__ float get_ex_field(float A0, float pulse_duration,
 }
 
 __global__ void update_ex_field(float A0, float* d_am, float fce, float dt, 
-				long long nt, float pulse_duration, float z0, float pulse_dz, 
+				unsigned int nt, float pulse_duration, float z0, float pulse_dz, 
 				float cellsize, float* d_ex, float q, float m)
 {
-	long long n = blockDim.x*blockIdx.x + threadIdx.x;
+	unsigned int n = blockDim.x*blockIdx.x + threadIdx.x;
         float z = (n + 0.5)*cellsize;
 	float t = nt*dt;
 	float sfce = sin(fce*t);
@@ -283,7 +288,7 @@ __global__ void update_ex_field(float A0, float* d_am, float fce, float dt,
 
 __global__ void kernel_generate_tn(float tstart, float dt, float* d_tn)
 {
-	long long n = blockDim.x*blockIdx.x + threadIdx.x;
+	unsigned int n = blockDim.x*blockIdx.x + threadIdx.x;
 	d_tn[n] = tstart + n*dt;
 }
 
@@ -305,15 +310,15 @@ __device__ void rotate_particle(float *vx, float* vy,  float E, float fce, float
 
 __global__ void trace_electrons_single_step(float* d_vx, float* d_vy, float* d_vz,
 					    float* d_z, float* d_fx, float* d_fz, 
-					    long long* d_associate, 
+					    unsigned int* d_associate, 
 					    float fce, float delta)
 {
-	long long n = blockDim.x*blockIdx.x + threadIdx.x;
+	unsigned int n = blockDim.x*blockIdx.x + threadIdx.x;
 	float vxt = d_vx[n];
 	float vyt = d_vy[n];
 	float dt = delta;
 	float tfce = fce;
-	long long ncell = d_associate[n];
+	unsigned int ncell = d_associate[n];
 	rotate_particle(&vxt, &vyt,  d_fx[ncell], tfce, dt);
 	d_vx[n] = vxt;
 	d_vy[n] = vyt;
@@ -325,8 +330,8 @@ __global__ void trace_electrons_single_step(float* d_vx, float* d_vy, float* d_v
 __global__ void postproc(float* d_z, float* d_vx, float* d_vy, 
 			 float zmin, float zmax, float sigma,  curandState* d_states)
 {
-	long long n = blockDim.x*blockIdx.x + threadIdx.x;
-	long long nr = threadIdx.x;
+	unsigned int n = blockDim.x*blockIdx.x + threadIdx.x;
+	unsigned int nr = threadIdx.x;
 	float L = zmax - zmin;
 	curandState rstate = d_states[nr];
 	if(d_z[n] > zmax)
@@ -346,13 +351,13 @@ __global__ void postproc(float* d_z, float* d_vx, float* d_vy,
 }
 
 __global__ void calculate_momentum_zdistribution(float* d_vx, float* d_vy, 
-					   long long* d_associate, 
-					   float* d_m, long long* d_n,
-					   long long nelectrons, float mass)
+					   unsigned int* d_associate, 
+					   float* d_m, unsigned int* d_n,
+					   unsigned int nelectrons, float mass)
 {
-	long long ncell = blockDim.x*blockIdx.x + threadIdx.x;
-	long long i;
-	long long ne = 0;
+	unsigned int ncell = blockDim.x*blockIdx.x + threadIdx.x;
+	unsigned int i;
+	unsigned int ne = 0;
 	float m = 0;
 	for (i = 0; i < nelectrons; ++i)
 	{
@@ -368,14 +373,14 @@ __global__ void calculate_momentum_zdistribution(float* d_vx, float* d_vy,
 	d_m[ncell] = 0.5*mass*m/ne;
 }
 
-void dump(char* savedir, char* filename, long long n, float* d_vx, float* d_vy, 
-	  long long*  d_cell_electron_association, float* d_m, long long* d_n, 
-	  long long nelectrons, long long ncells, float m, float cellsize, float z1, float dt, 
-	  long long max_threads)
+void dump(char* savedir, char* filename, unsigned int n, float* d_vx, float* d_vy, 
+	  unsigned int*  d_cell_electron_association, float* d_m, unsigned int* d_n, 
+	  unsigned int nelectrons, unsigned int ncells, float m, float cellsize, float z1, float dt, 
+	  unsigned int max_threads)
 {
 	FILE* to;
 	float* momentum = (float*)malloc(sizeof(float)*ncells);
-	long long i;
+	unsigned int i;
 	char filenamei[PATH_MAX];
 	sprintf(filenamei, "%s/%s_%d.dat", savedir, filename, n);
 	to = fopen(filenamei, "w");
@@ -393,48 +398,41 @@ void dump(char* savedir, char* filename, long long n, float* d_vx, float* d_vy,
 
 __global__ void setup_rstates(curandState* states, unsigned long rseed)
 {
-	long long n = blockDim.x*blockIdx.x + threadIdx.x;
+	unsigned int n = blockDim.x*blockIdx.x + threadIdx.x;
 	curand_init(rseed, n, 0, &states[n]);
 }
 
-__global__ void calculate_rho(long long* d_associate, long long* d_rho, long long nelectrons)
-{
-	long long ncell = blockDim.x*blockIdx.x + threadIdx.x;
-	long long i;
-	long long rho = 0;
-	for (i = 0; i < nelectrons; ++i)
-	{
-		if (d_associate[i]==ncell)
-		{
-			rho++;
-		}
-	}
-	d_rho[ncell] = rho;
+__global__  void do_calculate_rho_cuda(unsigned int* d_associate, 
+				       unsigned int* d_rho)
+{	
+	unsigned int nelectron = blockDim.x*blockIdx.x + threadIdx.x;
+	unsigned int ncell = d_associate[nelectron];
+	atomicInc(&d_rho[ncell], UINT_MAX);
 }
 
 __global__ void generate_kn(float k0, float dx, float* d_k)
 {
-	long long n = blockDim.x*blockIdx.x + threadIdx.x;
+	unsigned int n = blockDim.x*blockIdx.x + threadIdx.x;
 	float k = k0*(n+1);
 	d_k[n] = k*k*diff2(k,dx/2);
 }
 
-__global__ void copy_rho_to_cufft(long long* d_rho, cufftComplex* data, float coeff)
+__global__ void copy_rho_to_cufft(unsigned int* d_rho, cufftComplex* data, float coeff)
 {
-	long long n = blockDim.x*blockIdx.x + threadIdx.x;
+	unsigned int n = blockDim.x*blockIdx.x + threadIdx.x;
 	data[n] = make_cuFloatComplex (coeff*(float)d_rho[n],0);
 }
 
 __global__ void copy_cufft_to_phi(float* d_phi, cufftComplex* data)
 {
-	long long n = blockDim.x*blockIdx.x + threadIdx.x;
+	unsigned int n = blockDim.x*blockIdx.x + threadIdx.x;
 	cufftComplex thisd = data[n];
 	d_phi[n] = cuCrealf(thisd);
 }
 
-__global__ void poisson_harmonics_transform(float* d_k, cufftComplex* data, long long nharm)
+__global__ void poisson_harmonics_transform(float* d_k, cufftComplex* data, unsigned int nharm)
 {
-	long long n = blockDim.x*blockIdx.x + threadIdx.x;
+	unsigned int n = blockDim.x*blockIdx.x + threadIdx.x;
 	cufftComplex thisd = data[n+1];
 	float r;
 	float i;
@@ -449,12 +447,12 @@ __global__ void zero_harm_hack_for_fftdata(cufftComplex* data)
 	data[0] =  make_cuFloatComplex(0,0);
 }
 
-__global__ void calculate_ez_cuda(float* d_phi, float* d_ez, long long ncells, float q, float m, float cellsize)
+__global__ void calculate_ez_cuda(float* d_phi, float* d_ez, unsigned int ncells, float q, float m, float cellsize)
 {
 	
-	long long n = blockDim.x*blockIdx.x + threadIdx.x;
-	long long nl = n - 1;
-	long long nr = n + 1;
+	unsigned int n = blockDim.x*blockIdx.x + threadIdx.x;
+	unsigned int nl = n - 1;
+	unsigned int nr = n + 1;
 	float qm = q/m;
 	if (n==0)
 	{
@@ -469,8 +467,8 @@ __global__ void calculate_ez_cuda(float* d_phi, float* d_ez, long long ncells, f
 	d_ez[n]= -qm*(d_phi[nr] - d_phi[nl])/2/cellsize/ncells;
 }
 
-void update_ez_cuda(cufftHandle plan, long long* d_rho, float* d_k, float* d_ez, float* d_phi, 
-		    cufftComplex* data, long long ncells, long long max_threads, 
+void update_ez_cuda(cufftHandle plan, unsigned int* d_rho, float* d_k, float* d_ez, float* d_phi, 
+		    cufftComplex* data, unsigned int ncells, unsigned int max_threads, 
 		    float dens_coeff, float q, float m, float cellsize)
 {
 	copy_rho_to_cufft<<<ncells/max_threads, max_threads>>>(d_rho, data, dens_coeff);
@@ -504,16 +502,16 @@ int main(int argc, char** argv)
 	float A0 = pulse.A0;
 	float pulse_dz = pulse.dz;
 	float pulse_z0 = pulse.z0;
-	long long nh  = simulation.nh;
+	unsigned int nh  = simulation.nh;
 	float tstart = simulation.tstart;
 	float tstop = simulation.tstop;
 	float dt = simulation.dt;
-	long long ntpoints = ceil((tstop-tstart)/dt);
+	unsigned int ntpoints = ceil((tstop-tstart)/dt);
 	float pulse_duration = pulse.T;
-	long long ncells = simulation.ncells;
-	long long nelectrons = simulation.nelectrons;
-	long long max_threads = global_settings.max_gpu_threads;
-	long long rseed = global_settings.rseed;
+	unsigned int ncells = simulation.ncells;
+	unsigned int nelectrons = simulation.nelectrons;
+	unsigned int max_threads = global_settings.max_gpu_threads;
+	unsigned int rseed = global_settings.rseed;
 	float z1 = simulation.z1;
 	float z2 = simulation.z2;
 	float dz = (z2-z1)/ncells;
@@ -525,6 +523,7 @@ int main(int argc, char** argv)
 	curandGenerator_t cuda_r;
 	char* filename = global_settings.save_file;
 	char* savedir = global_settings.savedir;
+	int static_ez = simulation.static_ez;
 
 	printf("Allocate memory\n");
 	
@@ -539,15 +538,16 @@ int main(int argc, char** argv)
 	float* d_vz = NULL;
 	float* d_z = NULL;
 	float* d_ex = NULL;
-	long long* d_cell_electron_association = NULL;
+	unsigned int* d_cell_electron_association = NULL;
+	unsigned int* d_buffer = NULL;
 
-	long long* n = (long long*)malloc(sizeof(long long)*ncells);
+	unsigned int* n = (unsigned int*)malloc(sizeof(unsigned int)*ncells);
 	float* d_am = NULL;
 	float* d_fm = NULL;
 	float* d_a = NULL;
 	float* d_m = NULL;
-	long long* d_n = NULL;
-	long long* d_rho;
+	unsigned int* d_n = NULL;
+	unsigned int* d_rho;
 	float* ez =  (float*)malloc(sizeof(float)*ncells);
 	float* d_ez;
 	float* d_phi;
@@ -568,12 +568,13 @@ int main(int argc, char** argv)
 	CUDA_CALL(cudaMalloc(&d_fm, sizeof(float)*nh));
 	CUDA_CALL(cudaMalloc(&d_a, sizeof(float)));
 	CUDA_CALL(cudaMalloc(&d_m, sizeof(float)*ncells));
-	CUDA_CALL(cudaMalloc(&d_n, sizeof(long long)*ncells));
-	CUDA_CALL(cudaMalloc(&d_rho, sizeof(long long)*ncells));
+	CUDA_CALL(cudaMalloc(&d_n, sizeof(unsigned int)*ncells));
+	CUDA_CALL(cudaMalloc(&d_rho, sizeof(unsigned int)*ncells));
 	CUDA_CALL(cudaMalloc(&d_ez, sizeof(float)*ncells));
 	CUDA_CALL(cudaMalloc(&d_phi, sizeof(float)*ncells));
 	CUDA_CALL(cudaMalloc(&d_k, sizeof(float)*ncells/2));
-	CUDA_CALL(cudaMalloc(&d_cell_electron_association, sizeof(long long)*nelectrons));
+	CUDA_CALL(cudaMalloc(&d_cell_electron_association, sizeof(unsigned int)*nelectrons));
+	CUDA_CALL(cudaMalloc(&d_buffer, sizeof(unsigned int)*nelectrons));
 
 	printf("Preparing the initial data\n");
 
@@ -589,11 +590,10 @@ int main(int argc, char** argv)
 	set_pos_uniform_cuda(cuda_r, d_z, z1, z2, nelectrons, max_threads);
 	generate_kn<<<ncells/max_threads/2, max_threads>>>(2*PI/(z2-z1), dz, d_k);
 	
-	long long i = 0;	
+	unsigned int i = 0;	
 		
 	printf("Start the calculations!\n");
 	
-		
 	for(i = 0; i < ntpoints; ++i)
 	{
 	
@@ -608,10 +608,14 @@ int main(int argc, char** argv)
 		global_associate_electrons_with_cells<<<nelectrons/max_threads, max_threads>>>(d_z,
 											       dz, 
 											       d_cell_electron_association);
-		calculate_rho<<<ncells/max_threads, max_threads>>>(d_cell_electron_association, d_rho, nelectrons);
-		update_ez_cuda(plan, d_rho, d_k, d_ez, d_phi, d_fft_data, ncells, 
-			       max_threads, density_simulation_coeff,q,m,dz );
-	
+		if(static_ez)
+		{
+			CUDA_CALL(cudaMemset(d_rho, 0, sizeof(unsigned int)*ncells));
+			do_calculate_rho_cuda<<<nelectrons/max_threads, max_threads>>>(d_cell_electron_association, d_rho);
+			update_ez_cuda(plan, d_rho, d_k, d_ez, d_phi, d_fft_data, ncells, 
+				       max_threads, density_simulation_coeff,q,m,dz );
+		}
+		
 		trace_electrons_single_step<<<nelectrons/max_threads, max_threads>>>(d_vx, d_vy, d_vz, 
 										     d_z, d_ex, d_ez, 
 										     d_cell_electron_association, 
@@ -622,7 +626,7 @@ int main(int argc, char** argv)
 			     d_n, nelectrons, ncells, m, dz, z1, dt, max_threads);
 		}
 	}
-
+	
 
 	printf("The calculations are done!\n");
 	printf("Free the memory\n");
@@ -643,6 +647,7 @@ int main(int argc, char** argv)
 	CUDA_CALL(cudaFree(d_rstates));
 	CUDA_CALL(cudaFree(d_fft_data));
 	CUDA_CALL(cudaFree(d_phi));
+	CUDA_CALL(cudaFree(d_buffer));
 	free(n);
 	free(ez);
 	cufftDestroy(plan);
