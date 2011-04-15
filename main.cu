@@ -555,17 +555,8 @@ int main(int argc, char** argv)
 	unsigned int i = 0;	
 		
 	printf("Start the calculations!\n");
-	FILE* to = fopen("p.dat", "w");
-	for (i = 0; i < ntpoints; ++i)
-	{
-		float a;
-		generate_ameandr<<<1, 1>>>(d_am, d_bm, d_fm, i*dt,  nh, d_a);
-		cudaMemcpy(&a, d_a, sizeof(float), cudaMemcpyDeviceToHost);
-		fprintf(to, "%e\n",  a);		
-	}
-	fclose(to);
 
-	/*
+	
 	for(i = 0; i < ntpoints; ++i)
 	{
 	
@@ -598,7 +589,7 @@ int main(int argc, char** argv)
 			     d_n, nelectrons, ncells, m, dz, z1, dt, max_threads);
 		}
 	}
-	*/
+	
 
 	printf("The calculations are done!\n");
 	printf("Free the memory\n");
