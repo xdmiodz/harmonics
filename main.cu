@@ -31,6 +31,7 @@ typedef struct pulse_cfg_str
 	float fce;
 	float z0;
 	float dz;
+	float pulse_ratio;
 }pulse_t;
 
 typedef struct simulation_str
@@ -119,6 +120,8 @@ int get_pulse_config(config_t* config, pulse_t* pulse)
 	pulse->z0 = (float)config_setting_get_float(setting);
 	setting = config_lookup(config, "pulse.dz");
 	pulse->dz = (float)config_setting_get_float(setting);
+	setting = config_lookup(config, "pulse.pulse_ratio");
+	pulse->pulse_ratio = (float)config_setting_get_float(setting);
 	return 0;
 }
 
@@ -171,79 +174,35 @@ int get_electron_config(config_t* config, electron_t* electron)
 	return  0;
 }
 
-__device__  float kernel_sinm(float fn, float fce, float t)
+
+
+__global__ void kernel_generate_ambmfm(float am, float fm, float pulse_ratio, float nh, float* d_fm, float* d_am, float* d_bm)
 {
-	return sin((fn - fce)*t);
-	
-} 
-
-__device__  float kernel_sinp(float fn, float fce, float t)
-{
-	return sin((fn + fce)*t);
-}
-
-__device__  float kernel_cosm(float fn, float fce, float t)
-{
-	return cos((fn - fce)*t);
-	
-} 
-
-__device__  float kernel_cosp(float fn, float fce, float t)
-{
-	return cos((fn + fce)*t);
-}
-
-
-__global__ void global_calculate_et(float* fn, float* fce, float* enp, float* enm, unsigned int nh, float* tn, float* et)
-{      
-	unsigned int nt = blockDim.x*blockIdx.x + threadIdx.x;
-	float t = tn[nt];
-	unsigned int i;
-	float kfce = *fce;
-	float cosp;
-	float cosm;
-	
-	//load vn coeff to shared memory
-	float ent = 0;
-	for ( i = 0; i < nh; ++i )
-	{
-		float fnt = fn[i];
-		float enpt = enp[i];
-		float enmt = enm[i];
-		cosp = kernel_cosp(fnt, kfce, t);
-		cosm = kernel_cosm(fnt, kfce, t);
-		ent  += enpt*cosp + enmt*cosm;
-	}
-	et[nt] = ent;
-}
-
-__global__ void kernel_generate_amfm(float am, float fm, float nh, float* d_fm, float* d_am)
-{
+	float tm = 2*PI/fm;
+	float tm1 = tm/pulse_ratio;
 	unsigned int i = blockDim.x*blockIdx.x + threadIdx.x;
-	d_am[i] = 4*am/PI/(2*i + 1);
-	d_fm[i] = fm*(2*i + 1);	
+	if (i==0)
+	{
+		d_bm[i] = (2*tm1-tm)/tm;
+		d_am[i] = 0;
+	}
+	else
+	{
+		d_am[i] = 2*am*(1-cos(i*fm*tm1))/(i*PI);
+		d_bm[i] = 2*am*sin(i*fm*tm1)/(i*PI);
+	}
+	d_fm[i] = fm*i;	
 }
 
-__global__ void generate_ameandr(float* d_am, float* d_fm, float t,  unsigned int nh, float* d_a)
+__global__ void generate_ameandr(float* d_am, float* d_bm, float* d_fm, float t,  unsigned int nh, float* d_a)
 {
 	unsigned int i;
 	float a = 0;
 	for (i = 0; i < nh; ++i)
 	{
-		a += d_am[i]*sin(d_fm[i]*t);
+		a += d_am[i]*sin(d_fm[i]*t) + d_bm[i]*cos(d_fm[i]*t);
 	}
 	*d_a = a; 
-}
-
-void generate_en(float* an, float* fn, float fce,
-		 unsigned int nh, float* enp, float* enm)
-{
-	unsigned int i;
-	for (i = 0; i < nh; ++i)
-	{     
-		enm[i] = 0.5*an[i];
-		enp[i] = -0.5*an[i];
-	}	
 }
 
 
@@ -508,6 +467,7 @@ int main(int argc, char** argv)
 	float dt = simulation.dt;
 	unsigned int ntpoints = ceil((tstop-tstart)/dt);
 	float pulse_duration = pulse.T;
+	float pulse_ratio = pulse.pulse_ratio;
 	unsigned int ncells = simulation.ncells;
 	unsigned int nelectrons = simulation.nelectrons;
 	unsigned int max_threads = global_settings.max_gpu_threads;
@@ -543,6 +503,7 @@ int main(int argc, char** argv)
 
 	unsigned int* n = (unsigned int*)malloc(sizeof(unsigned int)*ncells);
 	float* d_am = NULL;
+	float* d_bm;
 	float* d_fm = NULL;
 	float* d_a = NULL;
 	float* d_m = NULL;
@@ -565,6 +526,7 @@ int main(int argc, char** argv)
 	CUDA_CALL(cudaMalloc(&d_z, sizeof(float)*nelectrons));
 	CUDA_CALL(cudaMalloc(&d_ex, sizeof(float)*ncells));
 	CUDA_CALL(cudaMalloc(&d_am, sizeof(float)*nh));
+	CUDA_CALL(cudaMalloc(&d_bm, sizeof(float)*nh));
 	CUDA_CALL(cudaMalloc(&d_fm, sizeof(float)*nh));
 	CUDA_CALL(cudaMalloc(&d_a, sizeof(float)));
 	CUDA_CALL(cudaMalloc(&d_m, sizeof(float)*ncells));
@@ -582,7 +544,7 @@ int main(int argc, char** argv)
 	CUDA_CALL(cudaMemset(d_m, 0, sizeof(float)*ncells));
 	CUDA_CALL(cudaMemset(d_ez, 0, sizeof(float)*ncells));
 	
-	kernel_generate_amfm<<<1,nh>>>(Am, fm, nh, d_fm, d_am);
+	kernel_generate_ambmfm<<<1,nh>>>(Am, fm, pulse_ratio, nh, d_fm, d_am, d_bm);
 
 	set_speed_maxwell_cuda(cuda_r, d_vx, sigma, nelectrons);
 	set_speed_maxwell_cuda(cuda_r, d_vy, sigma, nelectrons);
@@ -593,12 +555,22 @@ int main(int argc, char** argv)
 	unsigned int i = 0;	
 		
 	printf("Start the calculations!\n");
-	
+	FILE* to = fopen("p.dat", "w");
+	for (i = 0; i < ntpoints; ++i)
+	{
+		float a;
+		generate_ameandr<<<1, 1>>>(d_am, d_bm, d_fm, i*dt,  nh, d_a);
+		cudaMemcpy(&a, d_a, sizeof(float), cudaMemcpyDeviceToHost);
+		fprintf(to, "%e\n",  a);		
+	}
+	fclose(to);
+
+	/*
 	for(i = 0; i < ntpoints; ++i)
 	{
 	
 		//printf("cycle number: %i\n", i);
-		generate_ameandr<<<1, 1>>>(d_am, d_fm, i*dt,  nh, d_a);
+		generate_ameandr<<<1, 1>>>(d_am, d_bm, d_fm, i*dt,  nh, d_a);
 		update_ex_field<<<ncells/max_threads, max_threads>>>(A0, d_a, fce, dt, i, 
 								     pulse_duration, 
 								     pulse_z0, pulse_dz, dz, 
@@ -626,7 +598,7 @@ int main(int argc, char** argv)
 			     d_n, nelectrons, ncells, m, dz, z1, dt, max_threads);
 		}
 	}
-	
+	*/
 
 	printf("The calculations are done!\n");
 	printf("Free the memory\n");
@@ -637,6 +609,7 @@ int main(int argc, char** argv)
 	CUDA_CALL(cudaFree(d_z));
 	CUDA_CALL(cudaFree(d_ex));
 	CUDA_CALL(cudaFree(d_am));
+	CUDA_CALL(cudaFree(d_bm));
 	CUDA_CALL(cudaFree(d_fm));
 	CUDA_CALL(cudaFree(d_a));
 	CUDA_CALL(cudaFree(d_cell_electron_association));
