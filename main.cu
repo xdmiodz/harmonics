@@ -183,7 +183,7 @@ __global__ void kernel_generate_ambmfm(float am, float fm, float pulse_ratio, fl
 	unsigned int i = blockDim.x*blockIdx.x + threadIdx.x;
 	if (i==0)
 	{
-		d_bm[i] = (2*tm1-tm)/tm;
+		d_bm[i] = am*(2*tm1-tm)/tm;
 		d_am[i] = 0;
 	}
 	else
@@ -555,7 +555,6 @@ int main(int argc, char** argv)
 	unsigned int i = 0;	
 		
 	printf("Start the calculations!\n");
-
 	
 	for(i = 0; i < ntpoints; ++i)
 	{
