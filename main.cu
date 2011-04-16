@@ -8,6 +8,7 @@
 #include "linux/limits.h"
 #include "limits.h"
 #include "cufft.h"
+#include "omp.h"
 
 #define PI (3.14159265)
 #define EV_IN_ERGS (1.60217646e-12)
@@ -59,11 +60,12 @@ electron_t;
 
 typedef struct global_settings_str
 {
-	char* save_file;
-	char* savedir;
+	char* msavedir;
+	char* vsavedir;
+	char* msavefile;
+	char* vsavefile;
 	unsigned int max_gpu_threads;
 	unsigned int rseed;
-	char* vsave;
 	unsigned int save_every_n;
 }global_setting_t;
 
@@ -129,14 +131,20 @@ int get_pulse_config(config_t* config, pulse_t* pulse)
 
 int get_global_config(config_t* config, global_setting_t* global_settings)
 {
-	config_setting_t* setting = config_lookup(config, "global.filename");
-	global_settings->save_file = (char*)config_setting_get_string(setting);	
+	config_setting_t* setting = config_lookup(config, "global.msavefile");
+	global_settings->msavefile = (char*)config_setting_get_string(setting);	
+	setting = config_lookup(config, "global.msavedir");
+	global_settings->msavedir = (char*)config_setting_get_string(setting);
+	setting = config_lookup(config, "global.vsavefile");
+	global_settings->vsavefile = (char*)config_setting_get_string(setting);
+	setting = config_lookup(config, "global.vsavedir");
+	global_settings->vsavedir = (char*)config_setting_get_string(setting);
 	setting = config_lookup(config, "global.max_gpu_threads");
 	global_settings->max_gpu_threads = (unsigned int)config_setting_get_int64(setting);
-	setting = config_lookup(config, "global.savedir");
-	global_settings->savedir = (char*)config_setting_get_string(setting);
 	setting = config_lookup(config, "global.rseed");
 	global_settings->rseed = (unsigned int)config_setting_get_int64(setting);
+	setting = config_lookup(config, "global.save_every_n");
+	global_settings->save_every_n = config_setting_get_int(setting);
 	return 0;
 }
 
@@ -444,31 +452,32 @@ void update_ez_cuda(cufftHandle plan, unsigned int* d_rho, float* d_k, float* d_
 void dump_vperp(char* savedir, char* savefile, unsigned int n, 
 		float* d_vx, float* d_vy, float* vx, float* vy, 
 		unsigned int* d_associate, unsigned int* associate,
-		unsigned int nelectrons, unsigned int ncells, float dz)
+		unsigned int nelectrons, unsigned int ncells, float m)
 {
 	unsigned int i;
 	char fullpath[PATH_MAX];
 	CUDA_CALL(cudaMemcpy(vx, d_vx, sizeof(float)*nelectrons, cudaMemcpyDeviceToHost));
 	CUDA_CALL(cudaMemcpy(vy, d_vy, sizeof(float)*nelectrons, cudaMemcpyDeviceToHost));
-	CUDA_CALL(cudaMemcpy(d_associate, associate, sizeof(float)*nelectrons, cudaMemcpyDeviceToHost));
+	CUDA_CALL(cudaMemcpy(associate, d_associate, sizeof(unsigned int)*nelectrons, cudaMemcpyDeviceToHost));
 	sprintf(fullpath, "%s/%s_%d.dat", savedir, savefile, n);
 	FILE* to;
-	for (i = 0; i < ncells; ++i)
+#pragma omp parallel for
+	for (i=0; i < nelectrons; ++i)
 	{
-		sprintf(fullpath, "%s/%s_%d_%d_vx.dat", savedir, savefile, n, i);
-		to = fopen(fullpath, "w");
-		fwrite(vx, sizeof(float), nelectrons, to);
-		fclose(to);
-		sprintf(fullpath, "%s/%s_%d_%d_vy.dat", savedir, savefile, n, i);
-		to = fopen(fullpath, "w");
-		fwrite(vy, sizeof(float), nelectrons, to);
-		fclose(to);
-		sprintf(fullpath, "%s/%s_%d_%d_association.dat", savedir, savefile, n, i);
-		to = fopen(fullpath, "w");
-		fwrite(associate, sizeof(long int), nelectrons, to);
-		fclose(to);
+		float vxt = vx[i];		
+		vx[i] = 0.5*m*(vxt*vxt+vy[i]*vy[i]);
 	}
-	printf("Particle speed and distribution dumped: %d\n", i);
+
+	sprintf(fullpath, "%s/%s_%d_vperp.dat", savedir, savefile, n);
+	to = fopen(fullpath, "w");
+	fwrite(vx, sizeof(float), nelectrons, to);
+	fclose(to);
+	sprintf(fullpath, "%s/%s_%d_association.dat", savedir, savefile, n);
+	to = fopen(fullpath, "w");
+	fwrite(associate, sizeof(unsigned int), nelectrons, to);
+	fclose(to);
+
+	printf("Particle speed and distribution dumped: %d\n", n);
 }
 
 int main(int argc, char** argv)
@@ -513,9 +522,12 @@ int main(int argc, char** argv)
 	float sigma = sqrt(EV_IN_ERGS*Te/m);
 	float plasma_density = simulation.plasma_density;
 	curandGenerator_t cuda_r;
-	char* filename = global_settings.save_file;
-	char* savedir = global_settings.savedir;
+	char* msavefile = global_settings.msavefile;
+	char* msavedir = global_settings.msavedir;
+	char* vsavefile = global_settings.vsavefile;
+	char* vsavedir = global_settings.vsavedir;
 	int static_ez = simulation.static_ez;
+	unsigned int save_every_n = global_settings.save_every_n;
 
 	printf("Allocate memory\n");
 	
@@ -530,10 +542,13 @@ int main(int argc, char** argv)
 	float* d_vz = NULL;
 	float* d_z = NULL;
 	float* d_ex = NULL;
-	unsigned int* d_cell_electron_association = NULL;
+	unsigned int* d_association = NULL;
 	unsigned int* d_buffer = NULL;
 
 	unsigned int* n = (unsigned int*)malloc(sizeof(unsigned int)*ncells);
+	unsigned int* association = (unsigned int*)malloc(sizeof(unsigned int)*nelectrons);
+	float* vx = (float*)malloc(sizeof(float)*nelectrons);
+	float* vy = (float*)malloc(sizeof(float)*nelectrons);
 	float* d_am = NULL;
 	float* d_bm;
 	float* d_fm = NULL;
@@ -567,7 +582,7 @@ int main(int argc, char** argv)
 	CUDA_CALL(cudaMalloc(&d_ez, sizeof(float)*ncells));
 	CUDA_CALL(cudaMalloc(&d_phi, sizeof(float)*ncells));
 	CUDA_CALL(cudaMalloc(&d_k, sizeof(float)*ncells/2));
-	CUDA_CALL(cudaMalloc(&d_cell_electron_association, sizeof(unsigned int)*nelectrons));
+	CUDA_CALL(cudaMalloc(&d_association, sizeof(unsigned int)*nelectrons));
 	CUDA_CALL(cudaMalloc(&d_buffer, sizeof(unsigned int)*nelectrons));
 
 	printf("Preparing the initial data\n");
@@ -601,23 +616,28 @@ int main(int argc, char** argv)
 		postproc<<<nelectrons/max_threads, max_threads>>>(d_z, d_vx, d_vy, z1, z2, sigma, d_rstates);
 		global_associate_electrons_with_cells<<<nelectrons/max_threads, max_threads>>>(d_z,
 											       dz, 
-											       d_cell_electron_association);
+											       d_association);
 		if(static_ez)
 		{
 			CUDA_CALL(cudaMemset(d_rho, 0, sizeof(unsigned int)*ncells));
-			do_calculate_rho_cuda<<<nelectrons/max_threads, max_threads>>>(d_cell_electron_association, d_rho);
+			do_calculate_rho_cuda<<<nelectrons/max_threads, max_threads>>>(d_association, d_rho);
 			update_ez_cuda(plan, d_rho, d_k, d_ez, d_phi, d_fft_data, ncells, 
 				       max_threads, density_simulation_coeff,q,m,dz );
 		}
 		
 		trace_electrons_single_step<<<nelectrons/max_threads, max_threads>>>(d_vx, d_vy, d_vz, 
 										     d_z, d_ex, d_ez, 
-										     d_cell_electron_association, 
+										     d_association, 
 										     fce, dt);
-		if ((i%100) == 0)
+		if ((i%save_every_n) == 0)
 		{
-			dump(savedir, filename, i/100, d_vx, d_vy, d_cell_electron_association, d_m,
+			dump(msavedir, msavefile, i/save_every_n, d_vx, d_vy, d_association, d_m,
 			     d_n, nelectrons, ncells, m, dz, z1, dt, max_threads);
+			dump_vperp(vsavedir, vsavefile, i/save_every_n, 
+				   d_vx, d_vy, vx, vy, 
+				   d_association, association,
+				   nelectrons, ncells, m);
+			
 		}
 	}
 	
@@ -634,7 +654,7 @@ int main(int argc, char** argv)
 	CUDA_CALL(cudaFree(d_bm));
 	CUDA_CALL(cudaFree(d_fm));
 	CUDA_CALL(cudaFree(d_a));
-	CUDA_CALL(cudaFree(d_cell_electron_association));
+	CUDA_CALL(cudaFree(d_association));
 	CUDA_CALL(cudaFree(d_m));
 	CUDA_CALL(cudaFree(d_n));
 	CUDA_CALL(cudaFree(d_rho));
@@ -645,6 +665,9 @@ int main(int argc, char** argv)
 	CUDA_CALL(cudaFree(d_buffer));
 	free(n);
 	free(ez);
+	free(association);
+	free(vx);
+	free(vy);
 	cufftDestroy(plan);
 	CURAND_CALL(curandDestroyGenerator(cuda_r));
 	config_destroy (&configuration);
