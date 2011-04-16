@@ -63,6 +63,8 @@ typedef struct global_settings_str
 	char* savedir;
 	unsigned int max_gpu_threads;
 	unsigned int rseed;
+	char* vsave;
+	unsigned int save_every_n;
 }global_setting_t;
 
 
@@ -437,8 +439,38 @@ void update_ez_cuda(cufftHandle plan, unsigned int* d_rho, float* d_k, float* d_
 	cufftExecC2C(plan, data, data, CUFFT_INVERSE);
 	copy_cufft_to_phi<<<ncells/max_threads, max_threads>>>(d_phi, data);
 	calculate_ez_cuda<<<ncells/max_threads, max_threads>>>(d_phi, d_ez, ncells, q,m, cellsize);
-	
 }
+
+void dump_vperp(char* savedir, char* savefile, unsigned int n, 
+		float* d_vx, float* d_vy, float* vx, float* vy, 
+		unsigned int* d_associate, unsigned int* associate,
+		unsigned int nelectrons, unsigned int ncells, float dz)
+{
+	unsigned int i;
+	char fullpath[PATH_MAX];
+	CUDA_CALL(cudaMemcpy(vx, d_vx, sizeof(float)*nelectrons, cudaMemcpyDeviceToHost));
+	CUDA_CALL(cudaMemcpy(vy, d_vy, sizeof(float)*nelectrons, cudaMemcpyDeviceToHost));
+	CUDA_CALL(cudaMemcpy(d_associate, associate, sizeof(float)*nelectrons, cudaMemcpyDeviceToHost));
+	sprintf(fullpath, "%s/%s_%d.dat", savedir, savefile, n);
+	FILE* to;
+	for (i = 0; i < ncells; ++i)
+	{
+		sprintf(fullpath, "%s/%s_%d_%d_vx.dat", savedir, savefile, n, i);
+		to = fopen(fullpath, "w");
+		fwrite(vx, sizeof(float), nelectrons, to);
+		fclose(to);
+		sprintf(fullpath, "%s/%s_%d_%d_vy.dat", savedir, savefile, n, i);
+		to = fopen(fullpath, "w");
+		fwrite(vy, sizeof(float), nelectrons, to);
+		fclose(to);
+		sprintf(fullpath, "%s/%s_%d_%d_association.dat", savedir, savefile, n, i);
+		to = fopen(fullpath, "w");
+		fwrite(associate, sizeof(long int), nelectrons, to);
+		fclose(to);
+	}
+	printf("Particle speed and distribution dumped: %d\n", i);
+}
+
 int main(int argc, char** argv)
 {
 	char* config_file = argv[1];
